@@ -18,6 +18,105 @@ A comprehensive **Model Context Protocol (MCP) server** that provides secure acc
 - **Matrix homeserver** access (Synapse, Dendrite, etc.)
 - **MCP client** (Claude Code, Codex, VS Code, etc.)
 
+## Setup: Stdio (recommended)
+
+The simplest way to use the server. Your MCP client launches it automatically via `npx` — no cloning, building, or running a server yourself. You just need three things from your Matrix homeserver: your user ID, an access token, and the homeserver URL.
+
+### Claude Code
+
+```bash
+claude mcp add --scope user matrix-server \
+  -e MATRIX_USER_ID=@you:your-homeserver.com \
+  -e MATRIX_ACCESS_TOKEN=syt_... \
+  -e MATRIX_HOMESERVER_URL=https://your-homeserver.com \
+  -- npx github:Vegard-/matrix-mcp-server
+```
+
+### Codex
+
+```bash
+codex mcp add matrix-server \
+  --env MATRIX_USER_ID=@you:your-homeserver.com \
+  --env MATRIX_ACCESS_TOKEN=syt_... \
+  --env MATRIX_HOMESERVER_URL=https://your-homeserver.com \
+  -- npx github:Vegard-/matrix-mcp-server
+```
+
+## Setup: HTTP server
+
+For multi-user deployments or when you want a persistent endpoint. Requires cloning the repo and running the server yourself. Supports optional OAuth token exchange via an identity provider (e.g. Keycloak).
+
+### 1. Start the server
+
+```bash
+git clone https://github.com/Vegard-/matrix-mcp-server.git
+cd matrix-mcp-server
+npm install && npm run build
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings (see below)
+
+npm start
+```
+
+### 2. Environment variables
+
+```bash
+# Server
+PORT=3000
+CORS_ALLOWED_ORIGINS=""              # Comma-separated (empty = allow all)
+
+# HTTPS (optional)
+ENABLE_HTTPS=false
+SSL_KEY_PATH="/path/to/private.key"
+SSL_CERT_PATH="/path/to/certificate.crt"
+
+# Matrix
+MATRIX_HOMESERVER_URL="https://matrix.example.com"
+MATRIX_DOMAIN="matrix.example.com"
+
+# OAuth / token exchange (optional)
+ENABLE_OAUTH=false
+ENABLE_TOKEN_EXCHANGE=false
+IDP_ISSUER_URL="https://keycloak.example.com/realms/matrix"
+IDP_AUTHORIZATION_URL="https://keycloak.example.com/realms/matrix/protocol/openid-connect/auth"
+IDP_TOKEN_URL="https://keycloak.example.com/realms/matrix/protocol/openid-connect/token"
+OAUTH_CALLBACK_URL="http://localhost:3000/callback"
+MATRIX_CLIENT_ID="your-matrix-client-id"
+MATRIX_CLIENT_SECRET="your-matrix-client-secret"
+```
+
+### 3. Connect your client
+
+#### Claude Code
+
+```bash
+claude mcp add --scope user --transport http matrix-server http://localhost:3000/mcp \
+  -H "matrix_user_id: @you:your-homeserver.com" \
+  -H "matrix_homeserver_url: https://your-homeserver.com" \
+  -H "matrix_access_token: syt_..."
+```
+
+#### Codex
+
+```bash
+codex mcp add matrix-server \
+  --url http://localhost:3000/mcp
+```
+
+### Testing with MCP Inspector
+
+```bash
+# Start the server
+npm run dev
+
+# In another terminal, run the inspector
+npx @modelcontextprotocol/inspector
+```
+
+Connect to `http://localhost:3000/mcp` to authenticate and test all available tools.
+
 ## Available Tools
 
 ### 📖 Tier 0: Read-Only Tools
@@ -157,105 +256,6 @@ A comprehensive **Model Context Protocol (MCP) server** that provides secure acc
   - `roomId` (string): Room to modify
   - `topic` (string): New room topic
   - Requires appropriate room permissions
-
-## Setup: Stdio (recommended)
-
-The simplest way to use the server. Your MCP client launches it automatically via `npx` — no cloning, building, or running a server yourself. You just need three things from your Matrix homeserver: your user ID, an access token, and the homeserver URL.
-
-### Claude Code
-
-```bash
-claude mcp add --scope user matrix-server \
-  -e MATRIX_USER_ID=@you:your-homeserver.com \
-  -e MATRIX_ACCESS_TOKEN=syt_... \
-  -e MATRIX_HOMESERVER_URL=https://your-homeserver.com \
-  -- npx github:Vegard-/matrix-mcp-server
-```
-
-### Codex
-
-```bash
-codex mcp add matrix-server \
-  --env MATRIX_USER_ID=@you:your-homeserver.com \
-  --env MATRIX_ACCESS_TOKEN=syt_... \
-  --env MATRIX_HOMESERVER_URL=https://your-homeserver.com \
-  -- npx github:Vegard-/matrix-mcp-server
-```
-
-## Setup: HTTP server
-
-For multi-user deployments or when you want a persistent endpoint. Requires cloning the repo and running the server yourself. Supports optional OAuth token exchange via an identity provider (e.g. Keycloak).
-
-### 1. Start the server
-
-```bash
-git clone https://github.com/Vegard-/matrix-mcp-server.git
-cd matrix-mcp-server
-npm install && npm run build
-
-# Configure environment
-cp .env.example .env
-# Edit .env with your settings (see below)
-
-npm start
-```
-
-### 2. Environment variables
-
-```bash
-# Server
-PORT=3000
-CORS_ALLOWED_ORIGINS=""              # Comma-separated (empty = allow all)
-
-# HTTPS (optional)
-ENABLE_HTTPS=false
-SSL_KEY_PATH="/path/to/private.key"
-SSL_CERT_PATH="/path/to/certificate.crt"
-
-# Matrix
-MATRIX_HOMESERVER_URL="https://matrix.example.com"
-MATRIX_DOMAIN="matrix.example.com"
-
-# OAuth / token exchange (optional)
-ENABLE_OAUTH=false
-ENABLE_TOKEN_EXCHANGE=false
-IDP_ISSUER_URL="https://keycloak.example.com/realms/matrix"
-IDP_AUTHORIZATION_URL="https://keycloak.example.com/realms/matrix/protocol/openid-connect/auth"
-IDP_TOKEN_URL="https://keycloak.example.com/realms/matrix/protocol/openid-connect/token"
-OAUTH_CALLBACK_URL="http://localhost:3000/callback"
-MATRIX_CLIENT_ID="your-matrix-client-id"
-MATRIX_CLIENT_SECRET="your-matrix-client-secret"
-```
-
-### 3. Connect your client
-
-#### Claude Code
-
-```bash
-claude mcp add --scope user --transport http matrix-server http://localhost:3000/mcp \
-  -H "matrix_user_id: @you:your-homeserver.com" \
-  -H "matrix_homeserver_url: https://your-homeserver.com" \
-  -H "matrix_access_token: syt_..."
-```
-
-#### Codex
-
-```bash
-codex mcp add matrix-server \
-  --url http://localhost:3000/mcp
-```
-
-### Testing with MCP Inspector
-
-```bash
-# Start the server
-npm run dev
-
-# In another terminal, run the inspector
-npx @modelcontextprotocol/inspector
-```
-
-Connect to `http://localhost:3000/mcp` to authenticate and test all available tools.
 
 ## Development
 
