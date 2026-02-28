@@ -43,6 +43,65 @@ export const waitForMessagesHandler = async (
     const collected: CollectedMessage[] = [];
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // --- Catch-up scan: check existing timeline for events newer than the since cursor ---
+    // This closes the sync gap where messages arrive between poll cycles.
+    if (sinceTimestamp) {
+      const roomsToScan = roomId
+        ? [client.getRoom(roomId)].filter(Boolean)
+        : client.getRooms();
+
+      for (const room of roomsToScan) {
+        if (!room) continue;
+        const events = room.getLiveTimeline().getEvents();
+        for (const event of events) {
+          if (event.getType() !== EventType.RoomMessage) continue;
+          if (event.getSender() === ownUserId) continue;
+
+          const ts = event.getTs();
+          const eid = event.getId();
+          if (ts < sinceTimestamp) continue;
+          if (ts === sinceTimestamp && eid === sinceEventId) continue;
+
+          const content = event.getContent();
+          collected.push({
+            roomId: event.getRoomId() || "",
+            roomName: room.name || event.getRoomId() || "",
+            sender: event.getSender() || "",
+            body: String(content?.body || ""),
+            eventId: eid || "",
+            timestamp: ts,
+          });
+        }
+      }
+
+      // If we found catch-up messages, return them immediately
+      if (collected.length > 0) {
+        collected.sort((a, b) => a.timestamp - b.timestamp);
+        const last = collected[collected.length - 1];
+        const nextSince = `${last.eventId}|${last.timestamp}`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                status: "messages_received",
+                messageCount: collected.length,
+                messages: collected.map((m) => ({
+                  room: m.roomName,
+                  roomId: m.roomId,
+                  sender: m.sender,
+                  body: m.body,
+                  eventId: m.eventId,
+                  timestamp: new Date(m.timestamp).toISOString(),
+                })),
+                since: nextSince,
+              }),
+            },
+          ],
+        };
+      }
+    }
+
     const result = await new Promise<{ messages: CollectedMessage[]; timedOut: boolean }>((resolve) => {
       const onEvent = (event: MatrixEvent) => {
         // Only m.room.message events

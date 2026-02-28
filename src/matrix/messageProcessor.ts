@@ -3,7 +3,9 @@ import { MatrixClient, EventType } from "matrix-js-sdk";
 import fetch from "node-fetch";
 
 /**
- * Represents a processed message that can be returned to MCP clients
+ * Represents a processed message that can be returned to MCP clients.
+ * Text messages include metadata (eventId, sender, timestamp, threading info)
+ * as a structured JSON object so callers can use eventId for replies/threading.
  */
 export type ProcessedMessage =
   | { type: "text"; text: string }
@@ -25,12 +27,28 @@ export async function processMessage(
   }
 
   const content = event.getContent();
-  
+
   if (event.getType() === EventType.RoomMessage && content) {
+    // Extract threading/relation metadata
+    const relatesToRaw = content["m.relates_to"] as Record<string, any> | undefined;
+    const replyToEventId = relatesToRaw?.["m.in_reply_to"]?.event_id as string | undefined;
+    const threadRootEventId = (relatesToRaw?.rel_type === "m.thread" || relatesToRaw?.rel_type === "io.element.thread")
+      ? (relatesToRaw.event_id as string | undefined)
+      : undefined;
+
     if (content.msgtype === "m.text") {
+      const metadata: Record<string, any> = {
+        eventId: event.getId(),
+        sender: event.getSender(),
+        timestamp: new Date(event.getTs()).toISOString(),
+        body: String(content.body || ""),
+      };
+      if (replyToEventId) metadata.replyToEventId = replyToEventId;
+      if (threadRootEventId) metadata.threadRootEventId = threadRootEventId;
+
       return {
         type: "text",
-        text: String(content.body || ""),
+        text: JSON.stringify(metadata),
       };
     } else if (content.msgtype === "m.image" && content.url) {
       try {

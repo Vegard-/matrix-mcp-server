@@ -181,7 +181,12 @@ export const registerMessageTools: ToolRegistrationFunction = (server) => {
     "get-room-messages",
     {
       title: "Get Matrix Room Messages",
-      description: "Retrieve recent messages from a specific Matrix room, including text and image content",
+      description:
+        "Retrieve recent messages from a specific Matrix room, including text and image content. " +
+        "Each text message is returned as a JSON object with fields: eventId, sender, timestamp, body, " +
+        "and optionally replyToEventId and threadRootEventId. " +
+        "Use eventId with send-message's replyToEventId to reply to a message, " +
+        "or with threadRootEventId to continue a thread.",
       inputSchema: {
         roomId: z.string().describe("Matrix room ID (e.g., !roomid:domain.com)"),
         limit: z
@@ -198,7 +203,10 @@ export const registerMessageTools: ToolRegistrationFunction = (server) => {
     "get-messages-by-date",
     {
       title: "Get Matrix Messages by Date Range",
-      description: "Retrieve messages from a Matrix room within a specific date range",
+      description:
+        "Retrieve messages from a Matrix room within a specific date range. " +
+        "Each text message is a JSON object with: eventId, sender, timestamp, body, " +
+        "and optionally replyToEventId and threadRootEventId.",
       inputSchema: {
         roomId: z.string().describe("Matrix room ID (e.g., !roomid:domain.com)"),
         startDate: z

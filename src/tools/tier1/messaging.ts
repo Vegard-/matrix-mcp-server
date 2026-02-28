@@ -6,11 +6,12 @@ import { ToolRegistrationFunction } from "../../types/tool-types.js";
 
 // Tool: Send message
 export const sendMessageHandler = async (
-  { roomId, message, messageType, replyToEventId }: { 
-    roomId: string; 
-    message: string; 
-    messageType: "text" | "html" | "emote"; 
-    replyToEventId?: string 
+  { roomId, message, messageType, replyToEventId, threadRootEventId }: {
+    roomId: string;
+    message: string;
+    messageType: "text" | "html" | "emote";
+    replyToEventId?: string;
+    threadRootEventId?: string;
   },
   { requestInfo, authInfo }: any
 ) => {
@@ -50,40 +51,57 @@ export const sendMessageHandler = async (
       };
     }
 
+    // Build the m.relates_to object for threading and/or replies
+    let relatesTo: Record<string, any> | undefined;
+
+    if (threadRootEventId) {
+      // Matrix threading — use io.element.thread for broad compatibility
+      // (Element/Dendrite use this over the spec-standard m.thread)
+      relatesTo = {
+        rel_type: "io.element.thread",
+        event_id: threadRootEventId,
+        // If replying within a thread, set is_falling_back so clients render correctly
+        "m.in_reply_to": {
+          event_id: replyToEventId || threadRootEventId,
+        },
+        is_falling_back: !replyToEventId,
+      };
+    } else if (replyToEventId) {
+      relatesTo = {
+        "m.in_reply_to": {
+          event_id: replyToEventId,
+        },
+      };
+    }
+
     let response;
-    if (messageType === "html") {
+    if (relatesTo) {
+      // Use sendMessage for structured content (threads/replies)
+      const msgtype = messageType === "html" ? "m.text"
+        : messageType === "emote" ? "m.emote"
+        : "m.text";
+      const content: Record<string, any> = {
+        msgtype,
+        body: message,
+        "m.relates_to": relatesTo,
+      };
+      if (messageType === "html") {
+        content.format = "org.matrix.custom.html";
+        content.formatted_body = message;
+      }
+      response = await client.sendEvent(roomId, "m.room.message" as any, content as any);
+    } else if (messageType === "html") {
       response = await client.sendHtmlMessage(roomId, message, message);
     } else if (messageType === "emote") {
       response = await client.sendEmoteMessage(roomId, message);
     } else {
-      // Default to text message
-      if (replyToEventId) {
-        const replyToEvent = room.findEventById(replyToEventId);
-        if (replyToEvent) {
-          response = await client.sendMessage(roomId, {
-            msgtype: "m.text" as any,
-            body: message,
-            "m.relates_to": {
-              "m.in_reply_to": {
-                event_id: replyToEventId,
-              },
-            },
-          });
-        } else {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Reply event ${replyToEventId} not found in room`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      } else {
-        response = await client.sendTextMessage(roomId, message);
-      }
+      response = await client.sendTextMessage(roomId, message);
     }
+
+    const extras = [
+      replyToEventId ? `reply to ${replyToEventId}` : "",
+      threadRootEventId ? `thread ${threadRootEventId}` : "",
+    ].filter(Boolean).join(", ");
 
     return {
       content: [
@@ -91,7 +109,7 @@ export const sendMessageHandler = async (
           type: "text",
           text: `Message sent successfully to ${room.name || roomId}
 Event ID: ${response.event_id}
-Message type: ${messageType}${replyToEventId ? ` (reply to ${replyToEventId})` : ""}`,
+Message type: ${messageType}${extras ? ` (${extras})` : ""}`,
         },
       ],
     };
@@ -217,7 +235,12 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
     "send-message",
     {
       title: "Send Matrix Message",
-      description: "Send a text message to a Matrix room, with support for plain text, HTML formatting, and replies",
+      description:
+        "Send a text message to a Matrix room, with support for plain text, HTML formatting, replies, and threads. " +
+        "Use replyToEventId to quote-reply to a specific message. " +
+        "Use threadRootEventId to send a message in a thread (the root event ID starts the thread). " +
+        "You can combine both to reply to a specific message within a thread. " +
+        "Get eventIds from get-room-messages or wait-for-messages.",
       inputSchema: {
         roomId: z.string().describe("Matrix room ID (e.g., !roomid:domain.com)"),
         message: z.string().describe("The message content to send"),
@@ -228,7 +251,12 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
         replyToEventId: z
           .string()
           .optional()
-          .describe("Event ID to reply to (optional)"),
+          .describe("Event ID to reply to. Get this from the eventId field in get-room-messages or wait-for-messages results."),
+        threadRootEventId: z
+          .string()
+          .optional()
+          .describe("Event ID of the thread root to send this message as part of a thread. " +
+            "If the message you want to reply to has a threadRootEventId, use that value here to stay in the same thread."),
       },
     },
     sendMessageHandler
