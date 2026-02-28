@@ -7,6 +7,18 @@ import { ToolRegistrationFunction } from "../../types/tool-types.js";
 const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
 const DEBOUNCE_MS = 500;
 
+// Internal cursor: tracks the last message we returned, so the catch-up scan
+// works even when the caller doesn't pass a `since` token.
+let lastSeenEventId: string | undefined;
+let lastSeenTimestamp = 0;
+
+function updateInternalCursor(eventId: string, timestamp: number) {
+  if (timestamp > lastSeenTimestamp || (timestamp === lastSeenTimestamp && eventId !== lastSeenEventId)) {
+    lastSeenEventId = eventId;
+    lastSeenTimestamp = timestamp;
+  }
+}
+
 interface CollectedMessage {
   roomId: string;
   roomName: string;
@@ -26,6 +38,7 @@ export const waitForMessagesHandler = async (
   const timeout = Math.max(timeoutMs, 1000);
 
   // Parse the continuation token: "eventId|timestamp"
+  // Fall back to the internal cursor if the caller doesn't provide one.
   let sinceTimestamp = 0;
   let sinceEventId: string | undefined;
   if (since) {
@@ -34,6 +47,9 @@ export const waitForMessagesHandler = async (
       sinceEventId = parts[0];
       sinceTimestamp = parseInt(parts[1], 10) || 0;
     }
+  } else if (lastSeenTimestamp) {
+    sinceTimestamp = lastSeenTimestamp;
+    sinceEventId = lastSeenEventId;
   }
 
   try {
@@ -78,6 +94,7 @@ export const waitForMessagesHandler = async (
       if (collected.length > 0) {
         collected.sort((a, b) => a.timestamp - b.timestamp);
         const last = collected[collected.length - 1];
+        updateInternalCursor(last.eventId, last.timestamp);
         const nextSince = `${last.eventId}|${last.timestamp}`;
         return {
           content: [
@@ -159,6 +176,7 @@ export const waitForMessagesHandler = async (
     let nextSince: string | undefined;
     if (result.messages.length > 0) {
       const last = result.messages[result.messages.length - 1];
+      updateInternalCursor(last.eventId, last.timestamp);
       nextSince = `${last.eventId}|${last.timestamp}`;
     } else if (since) {
       nextSince = since; // No new messages, return same token
