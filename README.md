@@ -5,7 +5,8 @@ A comprehensive **Model Context Protocol (MCP) server** that provides secure acc
 ## Features
 
 - 🔐 **OAuth 2.0 Authentication** with token exchange support
-- 📱 **15 Matrix Tools** organized by functionality tiers
+- 📱 **16 Matrix Tools** organized by functionality tiers
+- 🔌 **Stdio & HTTP transports** — use via `npx` or as an HTTP server
 - 🏠 **Multi-homeserver Support** with configurable endpoints
 - 🔄 **Real-time Operations** with ephemeral client management
 - 🚀 **Production Ready** with comprehensive error handling
@@ -19,11 +20,29 @@ A comprehensive **Model Context Protocol (MCP) server** that provides secure acc
 - **Matrix homeserver** access (Synapse, Dendrite, etc.)
 - **MCP client** (Claude Desktop, VS Code with MCP extension, etc.)
 
-### Installation
+### Option A: npx / stdio (simplest)
+
+No server to manage — runs as a child process of your MCP client.
+
+```bash
+# Set environment variables (or use a .env file in the working directory)
+export MATRIX_USER_ID="@you:your-homeserver.com"
+export MATRIX_ACCESS_TOKEN="syt_..."
+export MATRIX_HOMESERVER_URL="https://your-homeserver.com"
+
+# Run directly
+npx github:Vegard-/matrix-mcp-server
+```
+
+See [Client Integration](#client-integration) below for Claude Code and Codex setup.
+
+### Option B: HTTP server
+
+For multi-user deployments, OAuth, or when you need a persistent endpoint.
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/Vegard-/matrix-mcp-server.git
 cd matrix-mcp-server
 
 # Install dependencies
@@ -43,10 +62,13 @@ npm start
 ### Development Mode
 
 ```bash
-# Start with hot reload (OAuth disabled for easier testing)
+# HTTP with hot reload
 npm run dev
 
-# Or start with OAuth enabled
+# Stdio with hot reload
+npm run dev:stdio
+
+# HTTP with OAuth enabled
 ENABLE_OAUTH=true npm run dev
 ```
 
@@ -124,6 +146,14 @@ ENABLE_OAUTH=true npm run dev
 - **`get-direct-messages`** - List all DM conversations
   - `includeEmpty` (boolean, default: false): Include DMs with no recent messages
   - Returns DM partners, last messages, and unread status
+
+#### **Real-time Tools**
+
+- **`wait-for-messages`** - Wait for new incoming messages in real time
+  - `roomId` (string, optional): Room to watch (omit to watch all rooms including DMs)
+  - `timeoutMs` (number, default: 30000): How long to wait in milliseconds
+  - `since` (string, optional): Continuation token from a previous call
+  - Returns messages as they arrive, with a `since` token for duplicate-free follow-up calls
 
 ### ✏️ Tier 1: Action Tools
 
@@ -233,19 +263,53 @@ MATRIX_CLIENT_SECRET="your-matrix-client-secret"
 
 ## Client Integration
 
-### Claude Code
+### Claude Code (stdio — recommended)
 
-Remember, the `MATRIX_ACCESS_TOKEN` header is an optional header. You should delete it if you have token exchange working. Obtain `MATRIX_MCP_TOKEN` from MCP Inspector.
+Add with user scope so it's available in every project:
 
 ```bash
-claude mcp add --transport http matrix-server http://localhost:3000/mcp -H "matrix_user_id:  @user1:matrix.example.com" -H "matrix_homeserver_url: https://localhost:8008" -H "matrix_access_token: ${MATRIX_ACCESS_TOKEN}" -H "Authorization: Bearer ${MATRIX_MCP_TOKEN}"
+claude mcp add --scope user matrix-server \
+  -e MATRIX_USER_ID=@you:your-homeserver.com \
+  -e MATRIX_ACCESS_TOKEN=syt_... \
+  -e MATRIX_HOMESERVER_URL=https://your-homeserver.com \
+  -- npx github:Vegard-/matrix-mcp-server
 ```
 
-### VS Code
+### Codex (stdio)
 
-Remember, the `matrix_access_token` header is an optional header. You should delete it if you have token exchange working.
+In your `codex` MCP config (e.g. `~/.codex/mcp.json`):
 
-In mcp.json:
+```json
+{
+  "servers": {
+    "matrix-server": {
+      "command": "npx",
+      "args": ["github:Vegard-/matrix-mcp-server"],
+      "env": {
+        "MATRIX_USER_ID": "@you:your-homeserver.com",
+        "MATRIX_ACCESS_TOKEN": "syt_...",
+        "MATRIX_HOMESERVER_URL": "https://your-homeserver.com"
+      }
+    }
+  }
+}
+```
+
+### Claude Code (HTTP)
+
+For HTTP transport with OAuth or token exchange:
+
+```bash
+claude mcp add --transport http matrix-server http://localhost:3000/mcp \
+  -H "matrix_user_id: @user1:matrix.example.com" \
+  -H "matrix_homeserver_url: https://localhost:8008" \
+  -H "matrix_access_token: ${MATRIX_ACCESS_TOKEN}" \
+  -H "Authorization: Bearer ${MATRIX_MCP_TOKEN}"
+```
+
+### VS Code (HTTP)
+
+In `.vscode/mcp.json`:
 
 ```json
 {
@@ -287,26 +351,30 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
 ### Available Scripts
 
 ```bash
-npm run build      # Build TypeScript to dist/
-npm run dev        # Development server with hot reload
-npm run start      # Production server
-npm run lint       # Run ESLint
-npm run test       # Run tests
+npm run build        # Build TypeScript to dist/
+npm run dev          # HTTP dev server with hot reload
+npm run dev:stdio    # Stdio dev mode with hot reload
+npm run start        # Production HTTP server
+npm run start:stdio  # Production stdio server
+npm run lint         # Run ESLint
+npm run test         # Run tests
 ```
 
 ### Project Structure
 
 ```
 src/
-├── http-server.ts           # Main HTTP server entry point
-├── server.ts               # MCP server configuration
+├── http-server.ts           # HTTP server entry point (Express)
+├── stdio-server.ts          # Stdio entry point (npx / CLI)
+├── server.ts               # MCP server configuration (shared)
 ├── tools/                  # Tool implementations
 │   ├── tier0/             # Read-only tools
 │   │   ├── rooms.ts       # Room information tools
 │   │   ├── messages.ts    # Message retrieval tools
 │   │   ├── users.ts       # User profile tools
 │   │   ├── search.ts      # Room search tools
-│   │   └── notifications.ts # Notification tools
+│   │   ├── notifications.ts # Notification tools
+│   │   └── wait-for-messages.ts # Real-time message polling
 │   └── tier1/             # Action tools
 │       ├── messaging.ts   # Message sending tools
 │       ├── room-management.ts # Room lifecycle tools
@@ -328,11 +396,9 @@ src/
 
 The server implements a three-layer architecture:
 
-1. **HTTP Layer** (`http-server.ts`): Express server with OAuth integration
-2. **MCP Layer** (`server.ts`): Tool registration and request routing
-3. **Matrix Layer** (`tools/`): Matrix homeserver communication
-
-Each tool creates ephemeral Matrix clients that authenticate via your configured method, perform the requested operation, and clean up automatically.
+1. **Transport Layer**: Stdio (`stdio-server.ts`) for CLI/npx usage, or HTTP (`http-server.ts`) with Express and optional OAuth
+2. **MCP Layer** (`server.ts`): Tool registration and request routing (shared by both transports)
+3. **Matrix Layer** (`tools/`): Matrix homeserver communication via cached clients
 
 ## License
 

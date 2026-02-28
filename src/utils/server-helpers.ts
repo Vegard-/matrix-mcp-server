@@ -47,6 +47,12 @@ export function getAccessToken(
     return oauthToken;
   }
 
+  // Fall back to environment variable (for stdio mode)
+  const envToken = process.env.MATRIX_ACCESS_TOKEN;
+  if (typeof envToken === "string" && envToken !== "") {
+    return envToken;
+  }
+
   return "";
 }
 
@@ -59,7 +65,7 @@ export function getMatrixContext(
   const matrixUserId =
     (Array.isArray(headers?.["matrix_user_id"])
       ? headers?.["matrix_user_id"][0]
-      : headers?.["matrix_user_id"]) || "";
+      : headers?.["matrix_user_id"]) || process.env.MATRIX_USER_ID || "";
   const homeserverUrl =
     (Array.isArray(headers?.["matrix_homeserver_url"])
       ? headers?.["matrix_homeserver_url"][0]

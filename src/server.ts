@@ -7,6 +7,7 @@ import { registerMessageTools } from "./tools/tier0/messages.js";
 import { registerUserTools } from "./tools/tier0/users.js";
 import { registerSearchTools } from "./tools/tier0/search.js";
 import { registerNotificationTools } from "./tools/tier0/notifications.js";
+import { registerWaitForMessagesTools } from "./tools/tier0/wait-for-messages.js";
 
 // Tier 1 (Action tools)
 import { registerMessagingTools } from "./tools/tier1/messaging.js";
@@ -35,6 +36,7 @@ registerMessageTools(server);     // get-room-messages, get-messages-by-date, id
 registerUserTools(server);        // get-user-profile, get-my-profile, get-all-users
 registerSearchTools(server);      // search-public-rooms
 registerNotificationTools(server); // get-notification-counts, get-direct-messages
+registerWaitForMessagesTools(server); // wait-for-messages
 
 // Tier 1: Action Matrix tools
 registerMessagingTools(server);       // send-message, send-direct-message

@@ -3,11 +3,16 @@
   "version": "1.0.0",
   "description": "MCP server that fronts a Matrix homeserver",
   "main": "dist/http-server.js",
+  "bin": {
+    "matrix-mcp-server": "dist/stdio-server.js"
+  },
   "type": "module",
   "scripts": {
     "start": "node dist/http-server.js",
+    "start:stdio": "node dist/stdio-server.js",
     "build": "tsc",
     "dev": "NODE_OPTIONS=--no-warnings tsx watch src/http-server.ts",
+    "dev:stdio": "NODE_OPTIONS=--no-warnings tsx src/stdio-server.ts",
     "lint": "eslint .",
     "test": "jest"
   },
