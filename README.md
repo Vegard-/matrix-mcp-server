@@ -1,14 +1,16 @@
 # Matrix MCP Server
 
-A comprehensive **Model Context Protocol (MCP) server** that provides secure access to Matrix homeserver functionality. Built with TypeScript, this server enables MCP clients to interact with Matrix rooms, messages, users, and more through a standardized interface.
+A comprehensive **Model Context Protocol (MCP) server** that provides secure access to Matrix homeserver functionality. Built with TypeScript, this server enables MCP clients to interact with Matrix rooms, messages, users, and more through a standardized interface — including full **end-to-end encrypted rooms**.
 
 ## Features
 
+- 🔒 **End-to-End Encryption** — reads and writes E2EE rooms natively, with persistent crypto state across restarts
 - 🔐 **OAuth 2.0 Authentication** with token exchange support
-- 📱 **16 Matrix Tools** organized by functionality tiers
+- 📱 **Matrix Tools** organized by functionality tiers
 - 🔌 **Stdio & HTTP transports** — use via `npx` or as an HTTP server
 - 🏠 **Multi-homeserver Support** with configurable endpoints
-- 🔄 **Real-time Operations** with ephemeral client management
+- ♻️ **Hot-reload** — update the server without dropping the MCP connection
+- 🔄 **Sync token persistence** — resumes exactly where it left off after restart
 - 🚀 **Production Ready** with comprehensive error handling
 - 📊 **Rich Responses** with detailed Matrix data
 
@@ -29,6 +31,7 @@ claude mcp add --scope user matrix-server \
   -e MATRIX_USER_ID=@you:your-homeserver.com \
   -e MATRIX_ACCESS_TOKEN=syt_... \
   -e MATRIX_HOMESERVER_URL=https://your-homeserver.com \
+  -e MATRIX_DATA_DIR=/path/to/persistent/data \
   -- npx github:Vegard-/matrix-mcp-server
 ```
 
@@ -39,8 +42,30 @@ codex mcp add matrix-server \
   --env MATRIX_USER_ID=@you:your-homeserver.com \
   --env MATRIX_ACCESS_TOKEN=syt_... \
   --env MATRIX_HOMESERVER_URL=https://your-homeserver.com \
+  --env MATRIX_DATA_DIR=/path/to/persistent/data \
   -- npx github:Vegard-/matrix-mcp-server
 ```
+
+> **Important:** Always set `MATRIX_DATA_DIR` to an absolute path. Without it, the server defaults to `{cwd}/.data`, which may vary depending on how your MCP client launches the process — causing a fresh crypto identity on every restart.
+
+## End-to-End Encryption
+
+The server speaks E2EE natively. It uses a custom SQLite-backed IndexedDB adapter (`better-sqlite3`) to persist the [matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk) state between restarts — no browser required.
+
+### How it works
+
+- **Phase 1** (automatic): Olm/Megolm crypto state is stored in `MATRIX_DATA_DIR` as a SQLite database. Device identity is stable across restarts, so other clients can trust and share keys with the server.
+- **Phase 2** (optional): Cross-signing and SSSS (Secret Storage) are bootstrapped when `MATRIX_PASSWORD` is set. This enables full user identity verification and key backup.
+
+### Enabling E2EE
+
+Phase 1 is always on. For Phase 2, add your Matrix account password to the env:
+
+```bash
+-e MATRIX_PASSWORD=your-matrix-password
+```
+
+A recovery key is auto-generated on first run and saved to `MATRIX_DATA_DIR/ssss-recovery-key`. Keep this file safe — it's needed to restore key backup access if the crypto store is lost.
 
 ## Setup: HTTP server
 
@@ -198,7 +223,13 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - `roomId` (string, optional): Room to watch (omit to watch all rooms including DMs)
   - `timeoutMs` (number, default: 30000): How long to wait in milliseconds
   - `since` (string, optional): Continuation token from a previous call
-  - Returns messages as they arrive, with a `since` token for duplicate-free follow-up calls
+  - Returns messages as they arrive with a `since` token for duplicate-free follow-up calls; each message includes an `isDM` field
+
+#### **Invite Tools**
+
+- **`get-pending-invites`** - List rooms you've been invited to but not yet joined
+  - _No parameters required_
+  - Returns room names, IDs, and who sent the invite
 
 ### ✏️ Tier 1: Action Tools
 
@@ -257,6 +288,37 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - `topic` (string): New room topic
   - Requires appropriate room permissions
 
+#### **Message Action Tools**
+
+- **`send-reaction`** - React to a message with an emoji
+  - `roomId` (string): Matrix room ID
+  - `eventId` (string): Event ID of the message to react to
+  - `emoji` (string): Emoji to react with (e.g., `👍`)
+
+- **`edit-message`** - Edit a previously sent message
+  - `roomId` (string): Matrix room ID
+  - `eventId` (string): Event ID of the message to edit
+  - `newBody` (string): Replacement message content
+
+- **`redact-event`** - Delete/redact a message
+  - `roomId` (string): Matrix room ID
+  - `eventId` (string): Event ID to redact
+  - `reason` (string, optional): Reason for removal
+
+#### **Thread Tools**
+
+- **`get-thread-messages`** - Retrieve all messages in a thread
+  - `roomId` (string): Matrix room ID
+  - `threadRootEventId` (string): Event ID of the thread root
+  - `limit` (number, default: 50): Maximum replies to return
+  - Returns the root event plus all replies, oldest first
+
+#### **Server Tools**
+
+- **`restart-server`** - Hot-reload the MCP server in place
+  - _No parameters required_
+  - The outer process stays alive; the inner process restarts cleanly, picking up any newly built code. Use after `npm run build` to deploy changes without reconnecting.
+
 ## Development
 
 ### Available Scripts
@@ -297,7 +359,9 @@ src/
 
 ## Security Considerations
 
-- 🔐 **Token Management**: All Matrix clients are ephemeral and cleaned up after operations
+- 🔒 **E2EE Native**: Reads and writes encrypted rooms using the Rust matrix-sdk-crypto engine; crypto state persists in SQLite so device identity is stable
+- 🔑 **SSSS Recovery Key**: Auto-generated on first run, stored at `MATRIX_DATA_DIR/ssss-recovery-key` (mode 0600) — back this up
+- 🔐 **Token Management**: Matrix clients are cached per user and reused across tool calls; access tokens stay server-side
 - 🛡️ **OAuth Integration**: Prevents direct Matrix token exposure through OAuth proxy
 - 🔍 **Permission Checks**: Respects Matrix room power levels and permissions
 - 🚫 **Input Validation**: Comprehensive parameter validation using Zod schemas
@@ -307,9 +371,11 @@ src/
 
 The server implements a three-layer architecture:
 
-1. **Transport Layer**: Stdio (`stdio-server.ts`) for CLI/npx usage, or HTTP (`http-server.ts`) with Express and optional OAuth
+1. **Transport Layer**: Stdio (`stdio-server.ts`) with hot-reload outer/inner process wrapper, or HTTP (`http-server.ts`) with Express and optional OAuth
 2. **MCP Layer** (`server.ts`): Tool registration and request routing (shared by both transports)
-3. **Matrix Layer** (`tools/`): Matrix homeserver communication via cached clients
+3. **Matrix Layer** (`tools/` + `src/matrix/`): Matrix homeserver communication via cached clients with persistent E2EE crypto store
+
+The stdio server uses a **hot-reload wrapper**: the outer process (`stdio-server.ts`) manages the MCP connection and spawns an inner process that runs the actual server. When the inner process exits with code 0 (triggered by the `restart-server` tool), the outer process immediately respawns it — picking up newly built code without dropping the MCP connection.
 
 ## License
 
