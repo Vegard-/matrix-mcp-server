@@ -32,6 +32,7 @@ claude mcp add --scope user matrix-server \
   -e MATRIX_ACCESS_TOKEN=syt_... \
   -e MATRIX_HOMESERVER_URL=https://your-homeserver.com \
   -e MATRIX_DATA_DIR=/path/to/persistent/data \
+  -e MATRIX_PASSWORD=your-matrix-password \
   -- npx github:Vegard-/matrix-mcp-server
 ```
 
@@ -43,6 +44,7 @@ codex mcp add matrix-server \
   --env MATRIX_ACCESS_TOKEN=syt_... \
   --env MATRIX_HOMESERVER_URL=https://your-homeserver.com \
   --env MATRIX_DATA_DIR=/path/to/persistent/data \
+  --env MATRIX_PASSWORD=your-matrix-password \
   -- npx github:Vegard-/matrix-mcp-server
 ```
 
@@ -100,6 +102,10 @@ SSL_CERT_PATH="/path/to/certificate.crt"
 # Matrix
 MATRIX_HOMESERVER_URL="https://matrix.example.com"
 MATRIX_DOMAIN="matrix.example.com"
+MATRIX_USER_ID="@bot:matrix.example.com"
+MATRIX_ACCESS_TOKEN="syt_..."
+MATRIX_DATA_DIR="/var/lib/matrix-mcp/data"  # Persistent crypto store — use an absolute path
+MATRIX_PASSWORD=""                           # Optional: enables cross-signing + SSSS (Phase 2 E2EE)
 
 # OAuth / token exchange (optional)
 ENABLE_OAUTH=false
