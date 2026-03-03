@@ -8,11 +8,13 @@ import { randomBytes } from "crypto";
 import { exchangeToken, TokenExchangeConfig } from "../auth/tokenExchange.js";
 import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.js";
 import { installIDBAdapter } from "./idb-sqlite-adapter.js";
+import { runMigrations } from "./migrations.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
 mkdirSync(DATA_DIR, { recursive: true });
+runMigrations(DATA_DIR);
 installIDBAdapter(DATA_DIR);
 
 /**
