@@ -280,7 +280,8 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
     "send-direct-message",
     {
       title: "Send Direct Message",
-      description: "Send a direct message to a Matrix user. Creates a new DM room if one doesn't exist",
+      description: "Send a direct message to a Matrix user. Creates a new DM room if one doesn't exist. " +
+        "Note: E2EE message content in DMs may be undecryptable on some homeservers (e.g., Dendrite) due to device key sharing limitations.",
       inputSchema: {
         targetUserId: z
           .string()

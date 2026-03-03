@@ -89,6 +89,7 @@ The server provides these MCP tools (all require `matrixUserId` parameter):
 - Default configuration is set up for Keycloak but can be customized via environment variables
 - Matrix client credentials are now configurable via environment variables
 - All HTTPS requests use `rejectUnauthorized: false` for local development
+- **E2EE DM limitation**: Encrypted DMs may not work on Dendrite due to device key sharing bugs. Encrypted group rooms work fine. This is a homeserver issue, not a server bug.
 
 ## API Changes
 

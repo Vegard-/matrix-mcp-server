@@ -168,8 +168,6 @@ export async function createMatrixClient(
     if (matrixPassword) {
       // Phase 2 runs in the background — don't block client creation.
       // E2EE will become available once bootstrap completes.
-      const phase2CachedRecoveryKey = cachedRecoveryKey;
-      const phase2RecoveryKeyFile = recoveryKeyFile;
       (async () => {
       try {
         const crypto = client.getCrypto();

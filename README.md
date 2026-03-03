@@ -69,6 +69,10 @@ Phase 1 is always on. For Phase 2, add your Matrix account password to the env:
 
 A recovery key is auto-generated on first run and saved to `MATRIX_DATA_DIR/ssss-recovery-key`. Keep this file safe — it's needed to restore key backup access if the crypto store is lost.
 
+### Known Limitations
+
+- **Encrypted DMs may not work on all homeservers.** Direct messages (1:1 rooms) use E2EE, but some homeservers — notably Dendrite — have known issues with device key distribution and to-device message delivery that prevent Megolm key sharing between devices. Encrypted group rooms are not affected. If you experience undecryptable DMs, this is a homeserver-side limitation, not a bug in this server. Synapse-based homeservers are fully supported.
+
 ## Setup: HTTP server
 
 For multi-user deployments or when you want a persistent endpoint. Requires cloning the repo and running the server yourself. Supports optional OAuth token exchange via an identity provider (e.g. Keycloak).

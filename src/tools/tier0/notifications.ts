@@ -251,7 +251,8 @@ export const registerNotificationTools: ToolRegistrationFunction = (server) => {
     "get-direct-messages",
     {
       title: "Get Direct Message Conversations",
-      description: "List all direct message conversations with their recent activity and unread status",
+      description: "List all direct message conversations with their recent activity and unread status. " +
+        "Note: E2EE message content in DMs may be undecryptable on some homeservers (e.g., Dendrite) due to device key sharing limitations.",
       inputSchema: {
         includeEmpty: z
           .boolean()
