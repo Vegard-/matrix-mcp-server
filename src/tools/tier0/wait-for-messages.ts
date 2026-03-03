@@ -305,20 +305,36 @@ export const waitForMessagesHandler = async (
       }
 
       // Register listener FIRST — before the catch-up scan — so any event that fires
-      // during the synchronous scan is collected (deduped by seenEventIds).
+      // during the scan is collected (deduped by seenEventIds).
       client.on(RoomEvent.Timeline, onEvent);
       client.on(ClientEvent.Room, onRoom);
 
-      // --- Catch-up scan: check existing timeline for events newer than the since cursor ---
-      // Runs synchronously (no await), so the event loop cannot interrupt it.
-      // On fresh start / after restart, uses a 15-minute lookback.
-      {
+      // --- Catch-up scan with scrollback ---
+      // Paginates backwards through room history until the timeline reaches the since
+      // cursor, ensuring no missed messages even after prolonged offline periods.
+      // Uses an async IIFE because scrollback requires await.
+      (async () => {
         const roomsToScan = roomId
           ? [client.getRoom(roomId)].filter(Boolean)
           : client.getRooms();
 
+        const MAX_SCROLLBACK_PAGES = 5; // per room, ~30 events each
         for (const room of roomsToScan) {
           if (!room) continue;
+
+          // Paginate backwards if the timeline doesn't reach the since cursor yet.
+          for (let page = 0; page < MAX_SCROLLBACK_PAGES; page++) {
+            const tlEvents = room.getLiveTimeline().getEvents();
+            const earliest = tlEvents[0];
+            if (!earliest || earliest.getTs() <= catchupSinceTs) break;
+            try {
+              const prevLen = tlEvents.length;
+              await client.scrollback(room, 30);
+              if (room.getLiveTimeline().getEvents().length === prevLen) break; // hit beginning
+            } catch { break; }
+          }
+
+          // Scan all loaded events (initial sync + scrollback)
           const events = room.getLiveTimeline().getEvents();
           for (const event of events) {
             const ts = event.getTs();
@@ -367,18 +383,18 @@ export const waitForMessagesHandler = async (
             });
           }
         }
-      }
 
-      // If catch-up found messages (or invites), return immediately.
-      if (collected.length > 0 || pendingInvites.length > 0) {
-        collected.sort((a, b) => a.timestamp - b.timestamp);
-        cleanup();
-        resolve({ messages: collected, reactions: collectedReactions, timedOut: false });
-        return;
-      }
+        // If catch-up found messages (or invites), return immediately.
+        if (collected.length > 0 || pendingInvites.length > 0) {
+          collected.sort((a, b) => a.timestamp - b.timestamp);
+          cleanup();
+          resolve({ messages: collected, reactions: collectedReactions, timedOut: false });
+          return;
+        }
 
-      // No catch-up messages — switch to live mode. Listener is already registered.
-      liveModeActive = true;
+        // No catch-up messages — switch to live mode. Listener is already registered.
+        liveModeActive = true;
+      })();
     });
 
     // Keep the sync token current after each wait cycle.
