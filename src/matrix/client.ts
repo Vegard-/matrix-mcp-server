@@ -166,10 +166,12 @@ export async function createMatrixClient(
     // identity and break trust with all previously verified devices.
     const matrixPassword = process.env.MATRIX_PASSWORD;
     if (matrixPassword) {
-      const PHASE2_TIMEOUT_MS = 15_000;
+      // Phase 2 runs in the background — don't block client creation.
+      // E2EE will become available once bootstrap completes.
+      const phase2CachedRecoveryKey = cachedRecoveryKey;
+      const phase2RecoveryKeyFile = recoveryKeyFile;
+      (async () => {
       try {
-        await Promise.race([
-          (async () => {
         const crypto = client.getCrypto();
         if (crypto) {
           // Load or generate a recovery key for SSSS.
@@ -211,16 +213,28 @@ export async function createMatrixClient(
             }
             if (!restored) {
               // SSSS restore didn't work (e.g., recovery key mismatch after migration,
-              // or SSSS contains stale keys from old broken bootstrap). Replace SSSS
-              // first (so cross-signing can store keys), then create fresh cross-signing.
-              console.error("[E2EE] SSSS restore failed. Resetting SSSS then creating fresh cross-signing.");
-              await crypto.bootstrapSecretStorage({
-                setupNewSecretStorage: true,
-                createSecretStorageKey: async () => ({
-                  keyInfo: {},
-                  privateKey: recoveryKeyBytes,
-                }),
-              });
+              // or SSSS contains stale keys from old broken bootstrap). Delete stale SSSS
+              // account data from server so bootstrapSecretStorage creates fresh without
+              // trying to migrate old (undecryptable) secrets.
+              console.error("[E2EE] SSSS restore failed. Clearing stale SSSS data then creating fresh.");
+              try {
+                // Clear the default key pointer and any secret storage keys
+                const accountData = client.store.accountData;
+                const ssssKeys = Object.keys(accountData || {}).filter(k =>
+                  k.startsWith("m.secret_storage.key.") || k === "m.secret_storage.default_key"
+                );
+                for (const key of ssssKeys) {
+                  await (client as any).setAccountData(key, {});
+                  console.error(`[E2EE] Cleared stale account data: ${key}`);
+                }
+                // Also clear cross-signing secrets from SSSS
+                for (const secret of ["m.cross_signing.master", "m.cross_signing.self_signing", "m.cross_signing.user_signing"]) {
+                  try { await (client as any).setAccountData(secret, {}); } catch (_) {}
+                }
+              } catch (e: any) {
+                console.warn("[E2EE] Failed to clear stale SSSS data:", e.message);
+              }
+              // Now create fresh cross-signing + SSSS from scratch
               await crypto.bootstrapCrossSigning({
                 authUploadDeviceSigningKeys: async (makeRequest) => {
                   await makeRequest({
@@ -296,12 +310,7 @@ export async function createMatrixClient(
             crossSigningStatus: finalCrossSigningStatus,
             deviceVerificationStatus: diagDevStatus,
           }, null, 2));
-        }
-        })(),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`Phase 2 timed out after ${PHASE2_TIMEOUT_MS / 1000}s`)), PHASE2_TIMEOUT_MS)
-          ),
-        ]);
+        } // if (crypto)
       } catch (e: any) {
         console.warn("[E2EE] Phase 2 bootstrap failed (non-fatal):", e.message);
         const diagPath = path.join(DATA_DIR, "e2ee-diagnostic.json");
@@ -311,6 +320,7 @@ export async function createMatrixClient(
           stack: e.stack?.split("\n").slice(0, 5),
         }, null, 2));
       }
+      })();
     }
 
     // Resume from a persisted sync token so /sync starts from exactly where we left off.
