@@ -159,21 +159,14 @@ export async function createMatrixClient(
     console.error(`[E2EE] Crypto initialised. Device ID: ${client.getDeviceId()}`);
 
     // Phase 2: SSSS + cross-signing — activated when MATRIX_PASSWORD env var is set.
+    // IMPORTANT: Check cross-signing status BEFORE bootstrapping. If the user already
+    // has cross-signing (e.g., from Element), creating new keys would reset their
+    // identity and break trust with all previously verified devices.
     const matrixPassword = process.env.MATRIX_PASSWORD;
     if (matrixPassword) {
       try {
         const crypto = client.getCrypto();
         if (crypto) {
-          await crypto.bootstrapCrossSigning({
-            authUploadDeviceSigningKeys: async (makeRequest) => {
-              await makeRequest({
-                type: "m.login.password",
-                identifier: { type: "m.id.user", user: userId },
-                password: matrixPassword,
-              });
-            },
-          });
-
           // Load or generate a recovery key for SSSS.
           // Stored in DATA_DIR/ssss-recovery-key so it survives server restarts.
           let recoveryKeyBytes: Uint8Array;
@@ -187,14 +180,47 @@ export async function createMatrixClient(
             console.error("[E2EE] Generated new SSSS recovery key — saved to", recoveryKeyFile);
           }
 
-          await crypto.bootstrapSecretStorage({
-            createSecretStorageKey: async () => ({
-              keyInfo: {},
-              privateKey: recoveryKeyBytes,
-            }),
-          });
+          const crossSigningStatus = await crypto.getCrossSigningStatus();
+          if (crossSigningStatus.privateKeysCachedLocally.masterKey) {
+            // Private keys already cached locally from persistent crypto store.
+            // No bootstrap needed — this device already has its identity.
+            console.error("[E2EE] Cross-signing private keys cached locally, skipping bootstrap");
+          } else if (crossSigningStatus.publicKeysOnDevice) {
+            // Public keys exist (fetched from server) but private keys not available locally.
+            // The user already has cross-signing from another device (e.g., Element).
+            // Try to restore private keys from SSSS — do NOT create new ones.
+            console.error("[E2EE] Cross-signing exists but private keys not local. Restoring from SSSS...");
+            await crypto.bootstrapSecretStorage({
+              createSecretStorageKey: async () => ({
+                keyInfo: {},
+                privateKey: recoveryKeyBytes,
+              }),
+            });
+            // Bootstrap without auth callback — only restores, doesn't upload new keys
+            await crypto.bootstrapCrossSigning({});
+          } else {
+            // No cross-signing at all — safe to create new keys for this user.
+            console.error("[E2EE] No existing cross-signing, creating new keys");
+            await crypto.bootstrapCrossSigning({
+              authUploadDeviceSigningKeys: async (makeRequest) => {
+                await makeRequest({
+                  type: "m.login.password",
+                  identifier: { type: "m.id.user", user: userId },
+                  password: matrixPassword,
+                });
+              },
+            });
+            await crypto.bootstrapSecretStorage({
+              createSecretStorageKey: async () => ({
+                keyInfo: {},
+                privateKey: recoveryKeyBytes,
+              }),
+            });
+          }
+
           await crypto.checkKeyBackupAndEnable();
-          console.error("[E2EE] Phase 2 complete: cross-signing + SSSS bootstrapped");
+          console.error("[E2EE] Phase 2 complete: cross-signing status: %j",
+            await crypto.getCrossSigningStatus());
         }
       } catch (e: any) {
         console.warn("[E2EE] Phase 2 bootstrap failed (non-fatal):", e.message);
