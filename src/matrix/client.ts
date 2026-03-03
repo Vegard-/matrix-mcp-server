@@ -192,14 +192,41 @@ export async function createMatrixClient(
             // The user already has cross-signing from another device (e.g., Element).
             // Try to restore private keys from SSSS — do NOT create new ones.
             console.error("[E2EE] Cross-signing exists but private keys not local. Restoring from SSSS...");
-            await crypto.bootstrapSecretStorage({
-              createSecretStorageKey: async () => ({
-                keyInfo: {},
-                privateKey: recoveryKeyBytes,
-              }),
-            });
-            // Bootstrap without auth callback — only restores, doesn't upload new keys
-            await crypto.bootstrapCrossSigning({});
+            let restored = false;
+            try {
+              await crypto.bootstrapSecretStorage({
+                createSecretStorageKey: async () => ({
+                  keyInfo: {},
+                  privateKey: recoveryKeyBytes,
+                }),
+              });
+              await crypto.bootstrapCrossSigning({});
+              const afterRestore = await crypto.getCrossSigningStatus();
+              restored = afterRestore.privateKeysCachedLocally.masterKey;
+            } catch (e: any) {
+              console.warn("[E2EE] SSSS restore failed:", e.message);
+            }
+            if (!restored) {
+              // SSSS restore didn't work (e.g., recovery key mismatch after migration,
+              // or SSSS contains stale keys from old broken bootstrap). Create fresh
+              // cross-signing keys — this replaces the broken server-side identity.
+              console.error("[E2EE] SSSS restore failed to recover private keys. Creating fresh cross-signing.");
+              await crypto.bootstrapCrossSigning({
+                authUploadDeviceSigningKeys: async (makeRequest) => {
+                  await makeRequest({
+                    type: "m.login.password",
+                    identifier: { type: "m.id.user", user: userId },
+                    password: matrixPassword,
+                  });
+                },
+              });
+              await crypto.bootstrapSecretStorage({
+                createSecretStorageKey: async () => ({
+                  keyInfo: {},
+                  privateKey: recoveryKeyBytes,
+                }),
+              });
+            }
           } else {
             // No cross-signing at all — safe to create new keys for this user.
             console.error("[E2EE] No existing cross-signing, creating new keys");

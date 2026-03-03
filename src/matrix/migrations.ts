@@ -49,6 +49,38 @@ const migrations: Migration[] = [
       console.error("[Migration v1] Crypto store reset complete. Next boot will establish clean cross-signing.");
     },
   },
+  {
+    version: 2,
+    name: "re-reset-crypto-for-ssss-fallthrough-fix",
+    migrate: (dataDir) => {
+      // Migration v1 + the initial cross-signing fix had a bug: path 2 (SSSS restore)
+      // silently failed when the recovery key didn't match server SSSS, leaving the
+      // device unsigned. The new code falls through to path 3 (create fresh keys) when
+      // restore fails. Re-wipe crypto store so the fixed code runs from clean state.
+      const recoveryKeyFile = path.join(dataDir, "ssss-recovery-key");
+      if (existsSync(recoveryKeyFile)) {
+        unlinkSync(recoveryKeyFile);
+        console.error("[Migration v2] Deleted ssss-recovery-key");
+      }
+      try {
+        const files = readdirSync(dataDir);
+        for (const file of files) {
+          if (
+            file.includes("matrix-sdk-crypto") ||
+            file.includes("matrix-js-sdk") ||
+            file.startsWith("idb-")
+          ) {
+            const filePath = path.join(dataDir, file);
+            rmSync(filePath, { force: true, recursive: true });
+            console.error(`[Migration v2] Deleted ${file}`);
+          }
+        }
+      } catch (e: any) {
+        console.warn("[Migration v2] Error cleaning crypto files:", e.message);
+      }
+      console.error("[Migration v2] Crypto store re-reset for SSSS fallthrough fix.");
+    },
+  },
 ];
 
 export const CURRENT_DATA_VERSION = migrations.length;
