@@ -101,16 +101,89 @@ export async function createMatrixClient(
     }
   };
 
-  // Fetch deviceId from whoami — required by initRustCrypto
+  // --- Authentication & Device ID ---
+  // When MATRIX_PASSWORD is set (non-OAuth), use password login to get a proper device.
+  // The shared-secret registration device ID ("shared_secret_registration") is a Dendrite
+  // placeholder that breaks E2EE key distribution — other clients can't query device keys
+  // for it. Password login creates a real device with proper key upload.
+  const matrixPassword = process.env.MATRIX_PASSWORD;
+  const loginStateFile = path.join(DATA_DIR, "login-state.json");
   let deviceId: string | undefined;
-  try {
-    const whoamiRes = await timedFetch(`${homeserverUrl}/_matrix/client/v3/account/whoami`, {
-      headers: { Authorization: `Bearer ${matrixAccessToken}` },
-    });
-    const whoami = await whoamiRes.json() as any;
-    deviceId = whoami.device_id;
-  } catch (e: any) {
-    console.warn("whoami failed, deviceId unknown:", e.message);
+  let effectiveAccessToken = matrixAccessToken;
+
+  if (matrixPassword && !enableOAuth) {
+    // Try to reuse a previous password-login session (same device, no device accumulation)
+    let loginState: { userId: string; deviceId: string; accessToken: string } | null = null;
+    try {
+      const saved = JSON.parse(readFileSync(loginStateFile, "utf-8"));
+      if (saved.userId === userId && saved.deviceId && saved.accessToken) {
+        loginState = saved;
+      }
+    } catch { /* No saved state */ }
+
+    if (loginState) {
+      // Verify the saved token is still valid
+      try {
+        const whoamiRes = await timedFetch(`${homeserverUrl}/_matrix/client/v3/account/whoami`, {
+          headers: { Authorization: `Bearer ${loginState.accessToken}` },
+        });
+        const whoami = await whoamiRes.json() as any;
+        if (whoami.user_id === userId) {
+          deviceId = loginState.deviceId;
+          effectiveAccessToken = loginState.accessToken;
+          console.error(`[Auth] Reusing saved login session (device: ${deviceId})`);
+        } else {
+          loginState = null; // Token valid but wrong user — re-login
+        }
+      } catch {
+        loginState = null; // Token expired or invalid — re-login
+        console.error("[Auth] Saved token invalid, will re-login with password");
+      }
+    }
+
+    if (!loginState) {
+      // Fresh password login — creates a real device with proper device ID
+      console.error("[Auth] Logging in with password to get proper device ID");
+      try {
+        const loginRes = await timedFetch(`${homeserverUrl}/_matrix/client/v3/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "m.login.password",
+            identifier: { type: "m.id.user", user: userId },
+            password: matrixPassword,
+          }),
+        });
+        const loginData = await loginRes.json() as any;
+        if (loginData.access_token && loginData.device_id) {
+          deviceId = loginData.device_id;
+          effectiveAccessToken = loginData.access_token;
+          // Persist so we reuse this device on restart
+          writeFileSync(loginStateFile, JSON.stringify({
+            userId,
+            deviceId: loginData.device_id,
+            accessToken: loginData.access_token,
+          }), { mode: 0o600 });
+          console.error(`[Auth] Password login successful (device: ${deviceId})`);
+        } else {
+          console.error("[Auth] Password login response missing token/device:", loginData);
+          // Fall back to existing token
+        }
+      } catch (e: any) {
+        console.error(`[Auth] Password login failed: ${e.message}, falling back to access token`);
+      }
+    }
+  } else {
+    // Non-password mode: fetch deviceId from whoami
+    try {
+      const whoamiRes = await timedFetch(`${homeserverUrl}/_matrix/client/v3/account/whoami`, {
+        headers: { Authorization: `Bearer ${matrixAccessToken}` },
+      });
+      const whoami = await whoamiRes.json() as any;
+      deviceId = whoami.device_id;
+    } catch (e: any) {
+      console.warn("whoami failed, deviceId unknown:", e.message);
+    }
   }
 
   // Load SSSS recovery key from disk — needed by getSecretStorageKey on second+ runs.
@@ -140,16 +213,16 @@ export async function createMatrixClient(
   });
 
   try {
-    if (enableOAuth && matrixAccessToken && enableTokenExchange) {
+    if (enableOAuth && effectiveAccessToken && enableTokenExchange) {
       // OAuth mode: use token exchange result to login
       const matrixLoginResponse = await client.loginRequest({
         type: "org.matrix.login.jwt",
-        token: matrixAccessToken,
+        token: effectiveAccessToken,
       });
       client.setAccessToken(matrixLoginResponse.access_token);
-    } else if (matrixAccessToken) {
-      // Non-OAuth mode: use provided Matrix access token directly
-      client.setAccessToken(matrixAccessToken);
+    } else if (effectiveAccessToken) {
+      // Non-OAuth mode: use access token (from password login or env var)
+      client.setAccessToken(effectiveAccessToken);
     } else {
       throw new Error("No valid access token available for Matrix client.");
     }
@@ -164,7 +237,6 @@ export async function createMatrixClient(
     // IMPORTANT: Check cross-signing status BEFORE bootstrapping. If the user already
     // has cross-signing (e.g., from Element), creating new keys would reset their
     // identity and break trust with all previously verified devices.
-    const matrixPassword = process.env.MATRIX_PASSWORD;
     if (matrixPassword) {
       // Phase 2 runs in the background — don't block client creation.
       // E2EE will become available once bootstrap completes.
