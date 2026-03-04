@@ -263,15 +263,32 @@ export const waitForMessagesHandler = async (
         }, DEBOUNCE_MS);
       };
 
-      // Live invite detection: resolve when a new room invite arrives during the wait
-      const onRoom = (room: any) => {
-        if (!liveModeActive) return;
-        if (room.getMyMembership() !== "invite") return;
+      // Live invite detection: resolve when a new room invite arrives during the wait.
+      // Two listeners for robustness:
+      // - ClientEvent.Room fires when a NEW Room object is added (first invite to unknown room)
+      // - RoomEvent.MyMembership fires on any membership change (catches re-invites to known rooms)
+      const invitedRoomIds = new Set(pendingInvites.map((i) => i.roomId));
+
+      const addInvite = (room: any) => {
+        if (invitedRoomIds.has(room.roomId)) return; // dedup
+        invitedRoomIds.add(room.roomId);
         const member = room.currentState?.getMember(ownUserId || "");
         const invitedBy = member?.events?.member?.getSender() ?? "unknown";
         pendingInvites.push({ roomId: room.roomId, roomName: room.name || room.roomId, invitedBy });
         cleanup();
         resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: false });
+      };
+
+      const onRoom = (room: any) => {
+        if (!liveModeActive) return;
+        if (room.getMyMembership() !== "invite") return;
+        addInvite(room);
+      };
+
+      const onMembership = (room: any, membership: string) => {
+        if (!liveModeActive) return;
+        if (membership !== "invite") return;
+        addInvite(room);
       };
 
       const timeoutHandle = setTimeout(() => {
@@ -299,6 +316,7 @@ export const waitForMessagesHandler = async (
       function cleanup() {
         client.removeListener(RoomEvent.Timeline, onEvent);
         client.removeListener(ClientEvent.Room, onRoom);
+        client.removeListener(RoomEvent.MyMembership, onMembership);
         clearTimeout(timeoutHandle);
         clearInterval(syncCheckHandle);
         clearInterval(cacheKeepAliveHandle);
@@ -310,6 +328,7 @@ export const waitForMessagesHandler = async (
       // during the scan is collected (deduped by seenEventIds).
       client.on(RoomEvent.Timeline, onEvent);
       client.on(ClientEvent.Room, onRoom);
+      client.on(RoomEvent.MyMembership, onMembership);
 
       // --- Catch-up scan with scrollback ---
       // Paginates backwards through room history until the timeline reaches the since
