@@ -146,9 +146,17 @@ export const waitForMessagesHandler = async (
     updateSyncToken(client.store.getSyncToken());
 
     // Build DM room set from m.direct account data event.
-    // Build DM room set: m.direct account data + fallback (2-member private room).
+    // getContent() can return the raw MatrixEvent internals instead of clean content,
+    // so validate each value is actually a string[] before adding to the set.
     const mDirectContent = (client.getAccountData(EventType.Direct) as any)?.getContent() ?? {};
-    const dmRoomIds = new Set<string>(Object.values(mDirectContent).flat() as string[]);
+    const dmRoomIds = new Set<string>();
+    for (const rooms of Object.values(mDirectContent)) {
+      if (Array.isArray(rooms)) {
+        for (const roomId of rooms) {
+          if (typeof roomId === "string" && roomId.startsWith("!")) dmRoomIds.add(roomId);
+        }
+      }
+    }
     // Fallback: rooms with exactly 2 joined members and no public join rule are likely DMs.
     for (const room of client.getRooms()) {
       if (!dmRoomIds.has(room.roomId)) {
