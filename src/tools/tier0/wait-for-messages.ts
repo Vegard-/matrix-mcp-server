@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { RoomEvent, MatrixEvent, EventType, ClientEvent } from "matrix-js-sdk";
+import { RoomEvent, MatrixEvent, MatrixEventEvent, EventType, ClientEvent } from "matrix-js-sdk";
 import { createConfiguredMatrixClient, getAccessToken, getMatrixContext } from "../../utils/server-helpers.js";
 import { removeClientFromCache } from "../../matrix/client.js";
 import { getCachedClient } from "../../matrix/clientCache.js";
@@ -324,6 +324,22 @@ export const waitForMessagesHandler = async (
         collected.push(msg);
 
         if (!liveModeActive) return; // collected during catch-up scan; resolve handled below
+
+        // For encrypted events in live mode, listen for decryption to update body in place.
+        // RoomEvent.Timeline fires with the encrypted payload before the SDK decrypts it.
+        // We collect the message immediately (with [encrypted] body as fallback) and update
+        // it when MatrixEventEvent.Decrypted fires — typically < 100ms for local Megolm keys,
+        // well within the 500ms debounce window.
+        if (msg.decryptionFailed) {
+          event.once(MatrixEventEvent.Decrypted, () => {
+            const decryptedContent = event.getClearContent?.() || event.getContent();
+            if (decryptedContent?.body) {
+              msg.body = String(decryptedContent.body);
+              msg.decryptionFailed = undefined;
+              msg.decryptionFailureReason = undefined;
+            }
+          });
+        }
 
         // Message arrived in live mode — cancel reaction debounce, resolve now
         if (reactionDebounceTimer) clearTimeout(reactionDebounceTimer);
