@@ -26,9 +26,15 @@ export async function processMessage(
     throw new Error("Matrix client is not initialized.");
   }
 
-  const content = event.getContent();
+  const evtType = event.getType();
+  // Handle both decrypted (m.room.message) and still-encrypted (m.room.encrypted) events
+  const isMessage = evtType === EventType.RoomMessage || evtType === EventType.RoomMessageEncrypted;
 
-  if (event.getType() === EventType.RoomMessage && content) {
+  if (isMessage) {
+    // Use decrypted content if available, fall back to raw content
+    const content = event.getClearContent?.() || event.getContent();
+    if (!content) return null;
+
     // Extract threading/relation metadata
     const relatesToRaw = content["m.relates_to"] as Record<string, any> | undefined;
 
@@ -41,13 +47,16 @@ export async function processMessage(
       ? (relatesToRaw.event_id as string | undefined)
       : undefined;
 
-    if (event.isDecryptionFailure() || content.msgtype === "m.text") {
+    const isEncrypted = evtType === EventType.RoomMessageEncrypted;
+    if (event.isDecryptionFailure() || isEncrypted || content.msgtype === "m.text") {
+      const body = content.body || (isEncrypted ? "[encrypted]" : "");
       const metadata: Record<string, any> = {
         eventId: event.getId(),
         sender: event.getSender(),
         timestamp: new Date(event.getTs()).toISOString(),
-        body: String(content.body || ""),
+        body: String(body),
       };
+      if (isEncrypted && !content.body) metadata.decryptionFailed = true;
       if (replyToEventId) metadata.replyToEventId = replyToEventId;
       if (threadRootEventId) metadata.threadRootEventId = threadRootEventId;
 
@@ -128,7 +137,7 @@ export function countMessagesByUser(
   const userMessageCounts: Record<string, number> = {};
   
   events
-    .filter((event) => event.getType() === EventType.RoomMessage)
+    .filter((event) => event.getType() === EventType.RoomMessage || event.getType() === EventType.RoomMessageEncrypted)
     .forEach((event) => {
       const sender = event.getSender();
       if (sender) {

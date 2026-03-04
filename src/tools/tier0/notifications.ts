@@ -141,20 +141,22 @@ export const getDirectMessagesHandler = async (
       };
     }
 
-    const dmList: any[] = [];
+    // Build DM entries with their timestamps for proper sorting
+    const dmEntries: { text: string; lastTs: number }[] = [];
 
     for (const room of dmRooms) {
-      // Get the other user in the DM
       const members = room.getJoinedMembers();
       const otherUser = members.find(
         (member) => member.userId !== matrixUserId
       );
-
       if (!otherUser) continue;
 
       const lastEvent = room.getLastLiveEvent();
-      const lastMessageTime = lastEvent?.getTs()
-        ? new Date(lastEvent.getTs()).toLocaleString()
+      if (!includeEmpty && !lastEvent) continue;
+
+      const lastTs = lastEvent?.getTs() || 0;
+      const lastMessageTime = lastTs
+        ? new Date(lastTs).toLocaleString()
         : "No recent messages";
       const lastMessageText =
         lastEvent?.getContent()?.body || "No recent messages";
@@ -162,11 +164,8 @@ export const getDirectMessagesHandler = async (
       const mentionCount =
         room.getUnreadNotificationCount(NotificationCountType.Highlight) || 0;
 
-      // Skip empty DMs if not requested
-      if (!includeEmpty && !lastEvent) continue;
-
-      dmList.push({
-        type: "text",
+      dmEntries.push({
+        lastTs,
         text: `${otherUser.name || otherUser.userId} (${otherUser.userId})
 Room ID: ${room.roomId}
 Last message: ${lastMessageTime}
@@ -180,7 +179,7 @@ Mentions: ${mentionCount}`,
       });
     }
 
-    if (dmList.length === 0) {
+    if (dmEntries.length === 0) {
       return {
         content: [
           {
@@ -194,23 +193,17 @@ Mentions: ${mentionCount}`,
     }
 
     // Sort by most recent activity
-    dmList.sort((a, b) => {
-      const aRoom = dmRooms.find((r) => a.text.includes(r.roomId));
-      const bRoom = dmRooms.find((r) => b.text.includes(r.roomId));
-      const aTime = aRoom?.getLastLiveEvent()?.getTs() || 0;
-      const bTime = bRoom?.getLastLiveEvent()?.getTs() || 0;
-      return bTime - aTime;
-    });
+    dmEntries.sort((a, b) => b.lastTs - a.lastTs);
 
     return {
       content: [
         {
           type: "text",
-          text: `Found ${dmList.length} direct message conversation${
-            dmList.length === 1 ? "" : "s"
+          text: `Found ${dmEntries.length} direct message conversation${
+            dmEntries.length === 1 ? "" : "s"
           }:`,
         },
-        ...dmList,
+        ...dmEntries.map((e) => ({ type: "text" as const, text: e.text })),
       ],
     };
   } catch (error: any) {
