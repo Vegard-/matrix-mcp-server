@@ -52,15 +52,23 @@ export const sendMessageHandler = async (
       };
     }
 
-    // Auto-detect thread: if replying to a message that's in a thread, stay in that thread
+    // Auto-detect thread: if replying to a message that's in a thread, stay in that thread.
+    // In group rooms (3+ members), auto-create a new thread when replying to a standalone message.
     let effectiveThreadRoot = threadRootEventId;
     if (replyToEventId && !effectiveThreadRoot) {
       const targetEvent = room.findEventById(replyToEventId);
       if (targetEvent) {
         const targetRelatesTo = targetEvent.getContent()?.["m.relates_to"];
         if (targetRelatesTo?.rel_type === "m.thread" || targetRelatesTo?.rel_type === "io.element.thread") {
+          // Target is in a thread — stay in it
           effectiveThreadRoot = targetRelatesTo.event_id;
+        } else if (room.getJoinedMemberCount() > 2) {
+          // Target is standalone in a group room — auto-start a new thread
+          effectiveThreadRoot = replyToEventId;
         }
+      } else if (room.getJoinedMemberCount() > 2) {
+        // Target event not in cache but it's a group room — auto-start thread
+        effectiveThreadRoot = replyToEventId;
       }
     }
 
@@ -253,7 +261,11 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
         "Use replyToEventId to quote-reply to a specific message. " +
         "Use threadRootEventId to send a message in a thread (the root event ID starts the thread). " +
         "You can combine both to reply to a specific message within a thread. " +
-        "Get eventIds from get-room-messages or wait-for-messages.",
+        "Get eventIds from get-room-messages or wait-for-messages. " +
+        "Auto-threading: In group rooms (3+ members), using replyToEventId automatically creates or joins a thread. " +
+        "If the target message is in a thread, the reply stays in that thread. " +
+        "If the target message is standalone, a new thread is started. " +
+        "In DMs (2 members), replyToEventId creates an inline reply without threading.",
       inputSchema: {
         roomId: z.string().describe("Matrix room ID (e.g., !roomid:domain.com)"),
         message: z.string().describe("The message content to send"),
@@ -271,6 +283,7 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
           .describe("Event ID of the thread root to send this message as part of a thread. " +
             "If the message you want to reply to has a threadRootEventId, use that value here to stay in the same thread."),
       },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     sendMessageHandler
   );
@@ -288,6 +301,7 @@ export const registerMessagingTools: ToolRegistrationFunction = (server) => {
           .describe("Target user's Matrix ID (e.g., @user:domain.com)"),
         message: z.string().describe("The message content to send"),
       },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     sendDirectMessageHandler
   );
