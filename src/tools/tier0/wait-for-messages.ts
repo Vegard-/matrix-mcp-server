@@ -217,8 +217,9 @@ export const waitForMessagesHandler = async (
           return;
         }
 
-        // Only m.room.message events from here
-        if (event.getType() !== EventType.RoomMessage) return;
+        // Only m.room.message and m.room.encrypted events from here
+        const evtType = event.getType();
+        if (evtType !== EventType.RoomMessage && evtType !== EventType.RoomMessageEncrypted) return;
         if (event.getSender() === ownUserId) return;
 
         // Skip events at or before the catch-up baseline
@@ -227,7 +228,8 @@ export const waitForMessagesHandler = async (
         if (ts < catchupSinceTs) return;
         if (ts === catchupSinceTs && eid === catchupSinceId) return;
 
-        const content = event.getContent();
+        // For encrypted events, try to use decrypted content if available
+        const content = event.getClearContent?.() || event.getContent();
         const relatesTo = content?.["m.relates_to"];
         if (relatesTo?.rel_type === "m.replace") return;
         if (event.isRedacted()) return;
@@ -241,7 +243,7 @@ export const waitForMessagesHandler = async (
           roomId: evtRoomId || "",
           roomName: room?.name || evtRoomId || "",
           sender: event.getSender() || "",
-          body: String(content?.body || ""),
+          body: String(content?.body || (evtType === EventType.RoomMessageEncrypted ? "[encrypted]" : "")),
           eventId: eid,
           timestamp: ts,
           isDM: dmRoomIds.has(evtRoomId || ""),
@@ -359,10 +361,12 @@ export const waitForMessagesHandler = async (
               continue;
             }
 
-            if (event.getType() !== EventType.RoomMessage) continue;
+            const scanEvtType = event.getType();
+            if (scanEvtType !== EventType.RoomMessage && scanEvtType !== EventType.RoomMessageEncrypted) continue;
             if (event.getSender() === ownUserId) continue;
 
-            const content = event.getContent();
+            // For encrypted events, try to use decrypted content if available
+            const content = event.getClearContent?.() || event.getContent();
             const relatesTo = content?.["m.relates_to"];
             if (relatesTo?.rel_type === "m.replace") continue;
             if (event.isRedacted()) continue;
@@ -373,7 +377,7 @@ export const waitForMessagesHandler = async (
               roomId: event.getRoomId() || "",
               roomName: room.name || event.getRoomId() || "",
               sender: event.getSender() || "",
-              body: String(content?.body || ""),
+              body: String(content?.body || (scanEvtType === EventType.RoomMessageEncrypted ? "[encrypted]" : "")),
               eventId: eid,
               timestamp: ts,
               isDM: dmRoomIds.has(event.getRoomId() || ""),
@@ -518,6 +522,7 @@ export const registerWaitForMessagesTools: ToolRegistrationFunction = (server) =
           .optional()
           .describe("Continuation token from a previous wait-for-messages call"),
       },
+      annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: true },
     },
     waitForMessagesHandler
   );
