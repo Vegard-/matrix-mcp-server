@@ -195,6 +195,10 @@ export const waitForMessagesHandler = async (
         // Track all events for diagnostics (live mode only to avoid catch-up noise)
         if (liveModeActive) {
           debugEventCounts[rawType] = (debugEventCounts[rawType] || 0) + 1;
+          // Targeted DM event logging — shows in stderr whether DM events reach the listener
+          if (dmRoomIds.has(evtRoomId || "")) {
+            console.error(`[wait-debug] DM event: room=${evtRoomId}, type=${rawType}, sender=${event.getSender()}, ts=${event.getTs()}`);
+          }
         }
 
         if (roomId && evtRoomId !== roomId) return;
@@ -482,11 +486,12 @@ export const waitForMessagesHandler = async (
     // Debug diagnostics: include event counts and drop reasons when no messages received.
     // This helps diagnose issues like encrypted DM events not being delivered by sync.
     const hasDebugData = Object.keys(debugEventCounts).length > 0 || Object.keys(debugDropReasons).length > 0;
-    const debugPayload = hasDebugData ? {
+    const debugPayload = result.timedOut ? {
       _debug: {
         liveEventCounts: debugEventCounts,
         ...(Object.keys(debugDropReasons).length > 0 ? { dropReasons: debugDropReasons } : {}),
         dmRoomCount: dmRoomIds.size,
+        dmRoomIds: [...dmRoomIds],
         joinedRoomCount: client.getRooms().filter((r) => r.getMyMembership() === "join").length,
       },
     } : {};
