@@ -10,6 +10,8 @@ import { spawn, ChildProcess } from "child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import server from "./server.js";
 import { shutdownAllClients } from "./matrix/clientCache.js";
+import { startAutoSync, stopAutoSync } from "./matrix/autoSync.js";
+import { closeMessageQueue } from "./matrix/messageQueue.js";
 
 // Self-wrapping hot-reload: the outer process (no MCP_CHILD env) stays alive and
 // restarts the inner process on clean exit (exit code 0). Claude Code's stdio
@@ -59,12 +61,16 @@ if (!process.env.MCP_CHILD) {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("matrix-mcp-server running on stdio");
+    // Start auto-sync loop — pushes Matrix events into the message queue
+    startAutoSync().catch((err) => console.error("[autoSync] Failed to start:", err));
     // Notify Claude Code to re-fetch the tool list (handles hot reload).
     setTimeout(() => server.sendToolListChanged(), 100);
   }
 
   function shutdown() {
     console.error("Shutting down...");
+    stopAutoSync();
+    closeMessageQueue();
     shutdownAllClients();
     process.exit(0);
   }

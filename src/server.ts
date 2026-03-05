@@ -8,6 +8,7 @@ import { registerUserTools } from "./tools/tier0/users.js";
 import { registerSearchTools } from "./tools/tier0/search.js";
 import { registerNotificationTools } from "./tools/tier0/notifications.js";
 import { registerWaitForMessagesTools } from "./tools/tier0/wait-for-messages.js";
+import { registerGetQueuedMessagesTools } from "./tools/tier0/get-queued-messages.js";
 import { registerInviteTools } from "./tools/tier0/invites.js";
 
 // Tier 1 (Action tools)
@@ -41,6 +42,7 @@ registerUserTools(server);        // get-user-profile, get-my-profile, get-all-u
 registerSearchTools(server);      // search-public-rooms
 registerNotificationTools(server); // get-notification-counts, get-direct-messages
 registerWaitForMessagesTools(server); // wait-for-messages
+registerGetQueuedMessagesTools(server); // get-queued-messages
 registerInviteTools(server);          // get-pending-invites
 
 // Tier 1: Action Matrix tools

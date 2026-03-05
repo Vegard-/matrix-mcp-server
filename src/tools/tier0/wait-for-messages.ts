@@ -1,601 +1,8 @@
 import { z } from "zod";
-import { RoomEvent, MatrixEvent, MatrixEventEvent, EventType, ClientEvent } from "matrix-js-sdk";
-import { createConfiguredMatrixClient, getAccessToken, getMatrixContext } from "../../utils/server-helpers.js";
-import { removeClientFromCache } from "../../matrix/client.js";
-import { getCachedClient } from "../../matrix/clientCache.js";
-import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import path from "path";
+import { getMessageQueue } from "../../matrix/messageQueue.js";
 
-const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds
-const DEBOUNCE_MS = 500;
-const REACTION_DEBOUNCE_MS = 2 * 60 * 1000; // 2 minutes — batch reactions before waking up
-const SYNC_CHECK_INTERVAL_MS = 3 * 60 * 1000; // Check sync health every 3 minutes
-const CACHE_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000; // Touch cache every 5 min to prevent TTL expiry during long waits
-const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
-mkdirSync(DATA_DIR, { recursive: true });
-const STATE_FILE = path.join(DATA_DIR, "sync-state.json");
-
-// Concurrency guard: only one wait-for-messages can be active at a time.
-// Multiple concurrent calls corrupt shared state (listeners, cursor, sync token).
-// Dead-man switch: auto-releases after GUARD_MAX_TTL_MS to prevent permanent lockout
-// from orphaned guards (e.g., unhandled rejection in Promise chain).
-let activeWaitResolve: (() => void) | null = null;
-let guardAcquiredAt = 0;
-const GUARD_MAX_TTL_MS = 10 * 60 * 1000; // 10 min absolute max
-
-// Internal cursor: tracks the last message we returned, so the catch-up scan
-// works even when the caller doesn't pass a `since` token.
-// Persisted to STATE_FILE so it survives server restarts.
-let lastSeenEventId: string | undefined;
-let lastSeenTimestamp = 0;
-let persistedSyncToken: string | undefined;
-
-// Load persisted cursor on module startup
-try {
-  const saved = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
-  if (saved.lastSeenTimestamp) lastSeenTimestamp = saved.lastSeenTimestamp;
-  if (saved.lastSeenEventId) lastSeenEventId = saved.lastSeenEventId;
-  if (saved.syncToken) persistedSyncToken = saved.syncToken;
-} catch {
-  // No state file yet — start fresh
-}
-
-function updateInternalCursor(eventId: string, timestamp: number) {
-  if (timestamp > lastSeenTimestamp || (timestamp === lastSeenTimestamp && eventId !== lastSeenEventId)) {
-    lastSeenEventId = eventId;
-    lastSeenTimestamp = timestamp;
-    try {
-      writeFileSync(STATE_FILE, JSON.stringify({ lastSeenEventId, lastSeenTimestamp, syncToken: persistedSyncToken }));
-    } catch {
-      // Non-fatal — in-memory cursor still works
-    }
-  }
-}
-
-function updateSyncToken(token: string | null) {
-  if (!token || token === persistedSyncToken) return;
-  persistedSyncToken = token;
-  try {
-    writeFileSync(STATE_FILE, JSON.stringify({ lastSeenEventId, lastSeenTimestamp, syncToken: persistedSyncToken }));
-  } catch {
-    // Non-fatal
-  }
-}
-
-interface CollectedMessage {
-  roomId: string;
-  roomName: string;
-  sender: string;
-  body: string;
-  eventId: string;
-  timestamp: number;
-  isDM: boolean;
-  threadRootEventId?: string;
-  replyToEventId?: string;
-  decryptionFailed?: boolean;
-  decryptionFailureReason?: string;
-}
-
-interface CollectedReaction {
-  roomId: string;
-  roomName: string;
-  sender: string;
-  emoji: string;
-  reactedToEventId: string;
-  eventId: string;
-  timestamp: number;
-}
-
-/**
- * Extracts a CollectedMessage from a Matrix event, or null if the event should be skipped.
- * Shared between catch-up scan and live listener to avoid duplicated filtering logic.
- */
-function extractMessage(
-  event: MatrixEvent,
-  ownUserId: string | null,
-  sinceTs: number,
-  sinceEventId: string | undefined,
-  seenEventIds: Set<string>,
-  dmRoomIds: Set<string>,
-  client: any,
-): CollectedMessage | null {
-  const evtType = event.getType();
-  if (evtType !== EventType.RoomMessage && evtType !== EventType.RoomMessageEncrypted) return null;
-  if (event.getSender() === ownUserId) return null;
-
-  const ts = event.getTs();
-  const eid = event.getId();
-  if (ts < sinceTs) return null;
-  if (ts === sinceTs && eid === sinceEventId) return null;
-
-  const content = event.getClearContent?.() || event.getContent();
-  const relatesTo = content?.["m.relates_to"];
-  if (relatesTo?.rel_type === "m.replace") return null;
-  if (event.isRedacted()) return null;
-
-  if (!eid || seenEventIds.has(eid)) return null;
-  seenEventIds.add(eid);
-
-  const evtRoomId = event.getRoomId() || "";
-  const room = client.getRoom(evtRoomId);
-  const isEncrypted = evtType === EventType.RoomMessageEncrypted;
-  const msg: CollectedMessage = {
-    roomId: evtRoomId,
-    roomName: room?.name || evtRoomId,
-    sender: event.getSender() || "",
-    body: String(content?.body || (isEncrypted ? "[encrypted]" : "")),
-    eventId: eid,
-    timestamp: ts,
-    isDM: dmRoomIds.has(evtRoomId),
-    threadRootEventId: relatesTo?.rel_type === "io.element.thread" || relatesTo?.rel_type === "m.thread"
-      ? relatesTo.event_id : undefined,
-    replyToEventId: relatesTo?.["m.in_reply_to"]?.event_id,
-  };
-  if (isEncrypted && !content?.body) {
-    msg.decryptionFailed = true;
-    const reason = (event as any).decryptionFailureReason;
-    if (reason) msg.decryptionFailureReason = reason;
-  }
-  return msg;
-}
-
-export const waitForMessagesHandler = async (
-  { roomId, timeoutMs, since }: { roomId?: string; timeoutMs: number; since?: string },
-  { requestInfo, authInfo }: any
-) => {
-  // Concurrency guard: reject if another wait is already active.
-  // Dead-man switch: if guard has been held longer than GUARD_MAX_TTL_MS, force-release it.
-  if (activeWaitResolve) {
-    const heldMs = Date.now() - guardAcquiredAt;
-    if (heldMs < GUARD_MAX_TTL_MS) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              status: "already_listening",
-              message: "Another wait-for-messages call is already active. Only one listener at a time is supported.",
-              ...(lastSeenEventId ? { since: `${lastSeenEventId}|${lastSeenTimestamp}` } : {}),
-            }),
-          },
-        ],
-      };
-    }
-    console.error(`[wait-for-messages] Guard held for ${Math.round(heldMs / 1000)}s — dead-man switch releasing`);
-    activeWaitResolve = null;
-  }
-
-  // Acquire the guard — released in finally block.
-  activeWaitResolve = () => {};
-  guardAcquiredAt = Date.now();
-  const releaseGuard = () => { activeWaitResolve = null; };
-
-  const { matrixUserId, homeserverUrl } = getMatrixContext(requestInfo?.headers);
-  const accessToken = getAccessToken(requestInfo?.headers, authInfo?.token);
-
-  // Clamp: minimum 1s, maximum 2^31-1 ms (setTimeout overflows above this)
-  const timeout = Math.min(Math.max(timeoutMs, 1000), 2147483647);
-
-  // Parse the continuation token: "eventId|timestamp"
-  // Fall back to the internal cursor if the caller doesn't provide one.
-  let sinceTimestamp = 0;
-  let sinceEventId: string | undefined;
-  if (since) {
-    const parts = since.split("|");
-    if (parts.length === 2) {
-      sinceEventId = parts[0];
-      sinceTimestamp = parseInt(parts[1], 10) || 0;
-    }
-  } else if (lastSeenTimestamp) {
-    sinceTimestamp = lastSeenTimestamp;
-    sinceEventId = lastSeenEventId;
-  }
-
-  try {
-    let client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken, persistedSyncToken);
-
-    // If the sync connection is unhealthy (RECONNECTING/ERROR/STOPPED), force a fresh client.
-    // A stale RECONNECTING client may never recover and silently misses all live events.
-    const initialSyncState = client.getSyncState();
-    if (initialSyncState && initialSyncState !== "SYNCING" && initialSyncState !== "PREPARED") {
-      console.error(`[wait-for-messages] Sync unhealthy (${initialSyncState}), forcing fresh client`);
-      updateSyncToken(client.store.getSyncToken());
-      removeClientFromCache(matrixUserId, homeserverUrl);
-      client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken, persistedSyncToken);
-    }
-
-    const ownUserId = client.getUserId();
-
-    // Persist the current sync token so the next client creation can resume from here.
-    updateSyncToken(client.store.getSyncToken());
-
-    // Build DM room set from m.direct account data event.
-    // getContent() can return the raw MatrixEvent internals instead of clean content,
-    // so validate each value is actually a string[] before adding to the set.
-    const mDirectContent = (client.getAccountData(EventType.Direct) as any)?.getContent() ?? {};
-    const dmRoomIds = new Set<string>();
-    for (const rooms of Object.values(mDirectContent)) {
-      if (Array.isArray(rooms)) {
-        for (const roomId of rooms) {
-          if (typeof roomId === "string" && roomId.startsWith("!")) dmRoomIds.add(roomId);
-        }
-      }
-    }
-    // Fallback: rooms with exactly 2 joined members and no public join rule are likely DMs.
-    for (const room of client.getRooms()) {
-      if (!dmRoomIds.has(room.roomId)) {
-        const joinRule = room.currentState.getStateEvents("m.room.join_rules", "")?.getContent()?.join_rule;
-        if (joinRule !== "public" && room.getJoinedMemberCount() === 2) {
-          dmRoomIds.add(room.roomId);
-        }
-      }
-    }
-
-    const collected: CollectedMessage[] = [];
-    const collectedReactions: CollectedReaction[] = [];
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    // Dedup set shared between catch-up scan and live listener
-    const seenEventIds = new Set<string>();
-
-    // --- Collect pending room invites ---
-    const pendingInvites = client.getRooms()
-      .filter((r) => r.getMyMembership() === "invite")
-      .map((room: any) => {
-        const member = room.currentState.getMember(ownUserId || "");
-        const invitedBy = member?.events?.member?.getSender() ?? "unknown";
-        return { roomId: room.roomId, roomName: room.name || room.roomId, invitedBy };
-      });
-
-    // Since cursor baseline
-    const catchupSinceTs = sinceTimestamp > 0 ? sinceTimestamp : Date.now() - 15 * 60 * 1000;
-    const catchupSinceId = sinceTimestamp > 0 ? sinceEventId : undefined;
-
-    const liveReactions: CollectedReaction[] = [];
-    // Diagnostics: count all timeline events by type to debug filtering issues
-    const debugEventCounts: Record<string, number> = {};
-    const debugDropReasons: Record<string, number> = {};
-
-    const result = await new Promise<{ messages: CollectedMessage[]; reactions: CollectedReaction[]; timedOut: boolean; syncStale?: boolean; reactionsOnly?: boolean }>((resolve) => {
-      let reactionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-      // Live mode is inactive during the synchronous catch-up scan; enabled after.
-      let liveModeActive = false;
-
-      const onEvent = (event: MatrixEvent) => {
-        const evtRoomId = event.getRoomId();
-        const rawType = event.getType();
-
-        // Track all events for diagnostics (live mode only to avoid catch-up noise)
-        if (liveModeActive) {
-          debugEventCounts[rawType] = (debugEventCounts[rawType] || 0) + 1;
-          // Targeted DM event logging — shows in stderr whether DM events reach the listener
-          if (dmRoomIds.has(evtRoomId || "")) {
-            console.error(`[wait-debug] DM event: room=${evtRoomId}, type=${rawType}, sender=${event.getSender()}, ts=${event.getTs()}`);
-          }
-        }
-
-        if (roomId && evtRoomId !== roomId) return;
-
-        // Reactions on own messages — collect for 2-min digest (live mode only)
-        if (rawType === "m.reaction") {
-          if (!liveModeActive) return;
-          const relatesTo = event.getContent()?.["m.relates_to"];
-          if (relatesTo?.rel_type === "m.annotation" && relatesTo.key && relatesTo.event_id) {
-            const targetEvent = evtRoomId ? client.getRoom(evtRoomId)?.findEventById(relatesTo.event_id) : null;
-            if (targetEvent?.getSender() === ownUserId) {
-              const room = evtRoomId ? client.getRoom(evtRoomId) : null;
-              liveReactions.push({
-                roomId: evtRoomId || "",
-                roomName: room?.name || evtRoomId || "",
-                sender: event.getSender() || "",
-                emoji: relatesTo.key,
-                reactedToEventId: relatesTo.event_id,
-                eventId: event.getId() || "",
-                timestamp: event.getTs(),
-              });
-              // Start/reset 2-min reaction debounce
-              if (reactionDebounceTimer) clearTimeout(reactionDebounceTimer);
-              reactionDebounceTimer = setTimeout(() => {
-                cleanup();
-                resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: false, reactionsOnly: true });
-              }, REACTION_DEBOUNCE_MS);
-            }
-          }
-          return;
-        }
-
-        // Use shared extraction logic for message events
-        const msg = extractMessage(event, ownUserId, catchupSinceTs, catchupSinceId, seenEventIds, dmRoomIds, client);
-        if (!msg) {
-          // Track why we dropped it (only in live mode to avoid catch-up noise)
-          if (liveModeActive) {
-            const evtType = rawType;
-            if (evtType !== EventType.RoomMessage && evtType !== EventType.RoomMessageEncrypted) {
-              debugDropReasons[`type:${rawType}`] = (debugDropReasons[`type:${rawType}`] || 0) + 1;
-            } else if (event.getSender() === ownUserId) {
-              debugDropReasons["own_message"] = (debugDropReasons["own_message"] || 0) + 1;
-            } else {
-              debugDropReasons["filtered"] = (debugDropReasons["filtered"] || 0) + 1;
-            }
-          }
-          return;
-        }
-        collected.push(msg);
-
-        if (!liveModeActive) return; // collected during catch-up scan; resolve handled below
-
-        // For encrypted events in live mode, listen for decryption to update body in place.
-        // RoomEvent.Timeline fires with the encrypted payload before the SDK decrypts it.
-        // We collect the message immediately (with [encrypted] body as fallback) and update
-        // it when MatrixEventEvent.Decrypted fires — typically < 100ms for local Megolm keys,
-        // well within the 500ms debounce window.
-        if (msg.decryptionFailed) {
-          event.once(MatrixEventEvent.Decrypted, () => {
-            const decryptedContent = event.getClearContent?.() || event.getContent();
-            if (decryptedContent?.body) {
-              msg.body = String(decryptedContent.body);
-              msg.decryptionFailed = undefined;
-              msg.decryptionFailureReason = undefined;
-            }
-          });
-        }
-
-        // Message arrived in live mode — cancel reaction debounce, resolve now
-        if (reactionDebounceTimer) clearTimeout(reactionDebounceTimer);
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          cleanup();
-          resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: false });
-        }, DEBOUNCE_MS);
-      };
-
-      // Live invite detection: resolve when a new room invite arrives during the wait.
-      // Two listeners for robustness:
-      // - ClientEvent.Room fires when a NEW Room object is added (first invite to unknown room)
-      // - RoomEvent.MyMembership fires on any membership change (catches re-invites to known rooms)
-      const invitedRoomIds = new Set(pendingInvites.map((i) => i.roomId));
-
-      const addInvite = (room: any) => {
-        if (invitedRoomIds.has(room.roomId)) return; // dedup
-        invitedRoomIds.add(room.roomId);
-        const member = room.currentState?.getMember(ownUserId || "");
-        const invitedBy = member?.events?.member?.getSender() ?? "unknown";
-        pendingInvites.push({ roomId: room.roomId, roomName: room.name || room.roomId, invitedBy });
-        cleanup();
-        resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: false });
-      };
-
-      const onRoom = (room: any) => {
-        if (!liveModeActive) return;
-        if (room.getMyMembership() !== "invite") return;
-        addInvite(room);
-      };
-
-      const onMembership = (room: any, membership: string) => {
-        if (!liveModeActive) return;
-        if (membership !== "invite") return;
-        addInvite(room);
-      };
-
-      const timeoutHandle = setTimeout(() => {
-        cleanup();
-        resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: true });
-      }, timeout);
-
-      const syncCheckHandle = setInterval(() => {
-        const state = client.getSyncState();
-        // Catch all unhealthy states: STOPPED, ERROR, RECONNECTING, null.
-        // RECONNECTING for 3+ min (the check interval) means the connection is stuck.
-        if (state === "STOPPED" || state === null || state === "ERROR" || state === "RECONNECTING") {
-          console.error(`[wait-for-messages] Sync unhealthy during wait (${state}), resolving as stale`);
-          cleanup();
-          resolve({ messages: collected, reactions: [...collectedReactions, ...liveReactions], timedOut: false, syncStale: true });
-        }
-      }, SYNC_CHECK_INTERVAL_MS);
-
-      // Keep the client cache alive during long waits by periodically touching lastAccessed.
-      // Without this, the 15-min cache TTL can expire mid-wait, killing the sync connection.
-      const cacheKeepAliveHandle = setInterval(() => {
-        getCachedClient(matrixUserId, homeserverUrl);
-      }, CACHE_KEEPALIVE_INTERVAL_MS);
-
-      function cleanup() {
-        client.removeListener(RoomEvent.Timeline, onEvent);
-        client.removeListener(ClientEvent.Room, onRoom);
-        client.removeListener(RoomEvent.MyMembership, onMembership);
-        clearTimeout(timeoutHandle);
-        clearInterval(syncCheckHandle);
-        clearInterval(cacheKeepAliveHandle);
-        if (debounceTimer) clearTimeout(debounceTimer);
-        if (reactionDebounceTimer) clearTimeout(reactionDebounceTimer);
-      }
-
-      // Register listener FIRST — before the catch-up scan — so any event that fires
-      // during the scan is collected (deduped by seenEventIds).
-      client.on(RoomEvent.Timeline, onEvent);
-      client.on(ClientEvent.Room, onRoom);
-      client.on(RoomEvent.MyMembership, onMembership);
-
-      // --- Catch-up scan with scrollback ---
-      // Paginates backwards through room history until the timeline reaches the since
-      // cursor, ensuring no missed messages even after prolonged offline periods.
-      // Uses an async IIFE because scrollback requires await.
-      (async () => {
-        const roomsToScan = roomId
-          ? [client.getRoom(roomId)].filter(Boolean)
-          : client.getRooms();
-
-        const MAX_SCROLLBACK_PAGES = 5; // per room, ~30 events each
-        for (const room of roomsToScan) {
-          if (!room) continue;
-
-          // Paginate backwards if the timeline doesn't reach the since cursor yet.
-          for (let page = 0; page < MAX_SCROLLBACK_PAGES; page++) {
-            const tlEvents = room.getLiveTimeline().getEvents();
-            const earliest = tlEvents[0];
-            if (!earliest || earliest.getTs() <= catchupSinceTs) break;
-            try {
-              const prevLen = tlEvents.length;
-              await client.scrollback(room, 30);
-              if (room.getLiveTimeline().getEvents().length === prevLen) break; // hit beginning
-            } catch { break; }
-          }
-
-          // Scan all loaded events (initial sync + scrollback)
-          const events = room.getLiveTimeline().getEvents();
-          for (const event of events) {
-            const ts = event.getTs();
-            const eid = event.getId();
-            if (ts < catchupSinceTs) continue;
-            if (ts === catchupSinceTs && eid === catchupSinceId) continue;
-
-            // Reactions: collect for context
-            if (event.getType() === "m.reaction") {
-              const relatesTo = event.getContent()?.["m.relates_to"];
-              if (relatesTo?.rel_type === "m.annotation" && relatesTo.key && relatesTo.event_id) {
-                collectedReactions.push({
-                  roomId: event.getRoomId() || "",
-                  roomName: room.name || event.getRoomId() || "",
-                  sender: event.getSender() || "",
-                  emoji: relatesTo.key,
-                  reactedToEventId: relatesTo.event_id,
-                  eventId: eid || "",
-                  timestamp: ts,
-                });
-              }
-              continue;
-            }
-
-            const msg = extractMessage(event, ownUserId, catchupSinceTs, catchupSinceId, seenEventIds, dmRoomIds, client);
-            if (msg) collected.push(msg);
-          }
-        }
-
-        // If catch-up found messages (or invites), return immediately.
-        if (collected.length > 0 || pendingInvites.length > 0) {
-          collected.sort((a, b) => a.timestamp - b.timestamp);
-          cleanup();
-          resolve({ messages: collected, reactions: collectedReactions, timedOut: false });
-          return;
-        }
-
-        // No catch-up messages — switch to live mode. Listener is already registered.
-        liveModeActive = true;
-      })();
-    });
-
-    // Keep the sync token current after each wait cycle.
-    updateSyncToken(client.store.getSyncToken());
-
-    // If sync went stale, proactively evict the cached client so the next call
-    // gets a fresh one immediately instead of needing two calls to recover.
-    if (result.syncStale) {
-      console.error("[wait-for-messages] Evicting stale client from cache for immediate recovery");
-      removeClientFromCache(matrixUserId, homeserverUrl);
-    }
-
-    // Build continuation token from the last message (reactions don't advance cursor)
-    let nextSince: string | undefined;
-    if (result.messages.length > 0) {
-      const last = result.messages[result.messages.length - 1];
-      updateInternalCursor(last.eventId, last.timestamp);
-      nextSince = `${last.eventId}|${last.timestamp}`;
-    } else if (since) {
-      nextSince = since;
-    }
-
-    const reactionPayload = result.reactions.length > 0 ? { reactions: result.reactions.map((r) => ({
-      room: r.roomName,
-      roomId: r.roomId,
-      sender: r.sender,
-      emoji: r.emoji,
-      reactedToEventId: r.reactedToEventId,
-      eventId: r.eventId,
-      timestamp: new Date(r.timestamp).toISOString(),
-    })) } : {};
-
-    // Include sync diagnostics on non-message responses for debugging reliability issues.
-    const syncState = client.getSyncState();
-    const syncDiag = syncState !== "SYNCING" ? { syncState: syncState ?? "null" } : {};
-
-    // Debug diagnostics: include event counts and drop reasons when no messages received.
-    // This helps diagnose issues like encrypted DM events not being delivered by sync.
-    const hasDebugData = Object.keys(debugEventCounts).length > 0 || Object.keys(debugDropReasons).length > 0;
-    const debugPayload = result.timedOut ? {
-      _debug: {
-        liveEventCounts: debugEventCounts,
-        ...(Object.keys(debugDropReasons).length > 0 ? { dropReasons: debugDropReasons } : {}),
-        dmRoomCount: dmRoomIds.size,
-        dmRoomIds: [...dmRoomIds],
-        joinedRoomCount: client.getRooms().filter((r) => r.getMyMembership() === "join").length,
-      },
-    } : {};
-
-    if (result.messages.length === 0) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              status: result.syncStale ? "sync_stale" : result.reactionsOnly ? "reactions_received" : result.timedOut ? "timeout" : "no_messages",
-              messages: [],
-              messageCount: 0,
-              ...(pendingInvites.length > 0 ? { invites: pendingInvites } : {}),
-              ...reactionPayload,
-              ...(nextSince ? { since: nextSince } : {}),
-              ...syncDiag,
-              ...debugPayload,
-            }),
-          },
-        ],
-      };
-    }
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify({
-            status: "messages_received",
-            messageCount: result.messages.length,
-            messages: result.messages.map((m) => ({
-              room: m.roomName,
-              roomId: m.roomId,
-              sender: m.sender,
-              body: m.body,
-              eventId: m.eventId,
-              timestamp: new Date(m.timestamp).toISOString(),
-              isDM: m.isDM,
-              ...(m.threadRootEventId ? { threadRootEventId: m.threadRootEventId } : {}),
-              ...(m.replyToEventId ? { replyToEventId: m.replyToEventId } : {}),
-              ...(m.decryptionFailed ? { decryptionFailed: true } : {}),
-              ...(m.decryptionFailureReason ? { decryptionFailureReason: m.decryptionFailureReason } : {}),
-            })),
-            ...(pendingInvites.length > 0 ? { invites: pendingInvites } : {}),
-            ...reactionPayload,
-            since: nextSince,
-          }),
-        },
-      ],
-    };
-  } catch (error: any) {
-    console.error(`Failed in wait-for-messages: ${error.message}`);
-    if (shouldEvictClientCache(error)) removeClientFromCache(matrixUserId, homeserverUrl);
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Error: Failed to wait for messages - ${error.message}`,
-        },
-      ],
-      isError: true,
-    };
-  } finally {
-    // Always release the concurrency guard.
-    releaseGuard!();
-  }
-};
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export const registerWaitForMessagesTools: ToolRegistrationFunction = (server) => {
   server.registerTool(
@@ -604,10 +11,9 @@ export const registerWaitForMessagesTools: ToolRegistrationFunction = (server) =
       title: "Wait for New Matrix Messages",
       description:
         "Wait for new incoming messages in real time, including direct messages. " +
-        "Watches all joined rooms by default, or a specific room if roomId is provided. " +
-        "Returns as soon as messages arrive (with batching) or when the timeout expires. " +
-        "Use the returned `since` token on subsequent calls to avoid duplicates. " +
-        "More efficient than polling get-room-messages repeatedly.",
+        "Returns ONLY notification counts and room summary (not message content). " +
+        "If messages are already queued, returns immediately. Otherwise blocks until " +
+        "new messages arrive or timeout. Use get-queued-messages to retrieve actual content.",
       inputSchema: {
         roomId: z
           .string()
@@ -620,10 +26,73 @@ export const registerWaitForMessagesTools: ToolRegistrationFunction = (server) =
         since: z
           .string()
           .optional()
-          .describe("Continuation token from a previous wait-for-messages call"),
+          .describe("Deprecated — ignored. Continuation token management is now internal."),
       },
       annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: true },
     },
-    waitForMessagesHandler
+    async ({ timeoutMs }: { roomId?: string; timeoutMs: number; since?: string }) => {
+      const queue = getMessageQueue();
+      const timeout = Math.min(Math.max(timeoutMs, 1000), 2147483647);
+
+      // Check if there are already queued items
+      let peek = queue.peek();
+
+      if (peek.count > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "messages_available",
+              count: peek.count,
+              types: peek.types,
+              rooms: peek.rooms,
+            }),
+          }],
+        };
+      }
+
+      // No items — wait for new-item event or timeout
+      const result = await new Promise<"new_items" | "timeout">((resolve) => {
+        const onNewItem = () => {
+          clearTimeout(timer);
+          resolve("new_items");
+        };
+
+        const timer = setTimeout(() => {
+          queue.removeListener("new-item", onNewItem);
+          resolve("timeout");
+        }, timeout);
+
+        queue.once("new-item", onNewItem);
+      });
+
+      if (result === "timeout") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              status: "timeout",
+              count: 0,
+              types: { messages: 0, reactions: 0, invites: 0 },
+              rooms: [],
+            }),
+          }],
+        };
+      }
+
+      // New items arrived — peek again for counts
+      peek = queue.peek();
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            status: "messages_available",
+            count: peek.count,
+            types: peek.types,
+            rooms: peek.rooms,
+          }),
+        }],
+      };
+    }
   );
 };
