@@ -283,6 +283,57 @@ class MessageQueue extends EventEmitter {
     this.stmts.setSyncToken.run(token);
   }
 
+  replaySince(sinceMs: number, roomId?: string): QueueContents {
+    const query = roomId
+      ? "SELECT * FROM queued_items WHERE timestamp >= ? AND room_id = ? ORDER BY timestamp ASC"
+      : "SELECT * FROM queued_items WHERE timestamp >= ? ORDER BY timestamp ASC";
+
+    const rows = roomId
+      ? this.db.prepare(query).all(sinceMs, roomId) as any[]
+      : this.db.prepare(query).all(sinceMs) as any[];
+
+    const messages: QueuedMessage[] = [];
+    const reactions: QueuedReaction[] = [];
+    const invites: QueuedInvite[] = [];
+
+    for (const row of rows) {
+      if (row.event_type === "message") {
+        messages.push({
+          eventId: row.event_id,
+          roomId: row.room_id,
+          roomName: row.room_name,
+          sender: row.sender,
+          body: row.body || "",
+          timestamp: row.timestamp,
+          isDM: row.is_dm === 1,
+          ...(row.thread_root_event_id ? { threadRootEventId: row.thread_root_event_id } : {}),
+          ...(row.reply_to_event_id ? { replyToEventId: row.reply_to_event_id } : {}),
+          ...(row.decryption_failed ? { decryptionFailed: true } : {}),
+          ...(row.decryption_failure_reason ? { decryptionFailureReason: row.decryption_failure_reason } : {}),
+        });
+      } else if (row.event_type === "reaction") {
+        reactions.push({
+          eventId: row.event_id,
+          roomId: row.room_id,
+          roomName: row.room_name,
+          sender: row.sender,
+          emoji: row.emoji || "",
+          reactedToEventId: row.reacted_to_event_id || "",
+          timestamp: row.timestamp,
+        });
+      } else if (row.event_type === "invite") {
+        invites.push({
+          roomId: row.room_id,
+          roomName: row.room_name,
+          invitedBy: row.invited_by || "",
+          timestamp: row.timestamp,
+        });
+      }
+    }
+
+    return { messages, reactions, invites };
+  }
+
   cleanup(maxAgeMs: number = 24 * 60 * 60 * 1000): number {
     const cutoff = Date.now() - maxAgeMs;
     const result = this.db.prepare("DELETE FROM queued_items WHERE fetched = 1 AND timestamp < ?").run(cutoff);
